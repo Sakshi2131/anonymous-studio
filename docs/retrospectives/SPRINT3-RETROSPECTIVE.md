@@ -12,14 +12,24 @@
 
 ## Sprint Summary
 
-This sprint focused on two primary goals:
-
-(1) completing the auth proxy identity-binding work that was partially shipped in Sprint 2 
-(2) beginning the role-based access control (RBAC) story (card-013 / issue #43) that was explicitly targeted as a Sprint 3 deliverable.
+This sprint focused on (2) primary goals:
+- Completing the auth proxy identity-binding work that was partially shipped in Sprint 2.
+- Beginning the role-based access control (RBAC) story (card-013 / issue #43) that was explicitly targeted as a Sprint 3 deliverable.
 
 A small UI enhancement (detection rationale show/hide toggle {PR #63}, was merged. At the sprint's close, the detection toggle and the auth proxy validation {issue #94} were confirmed complete, but role-based authentication {issue #43} has remaining open work items and will be carried forward to Sprint 4. Five new OpenFGA/AuthZ issues {#95–#100} were scoped and added to the backlog at the end of the sprint to lay the groundwork for an authorization control plane. 
 
 Contribution imbalance continued for the third consecutive sprint: two of four team members have still made zero direct code contributions throughout the project's lifecycle. Despite previous action items requiring each teammember merge at least one PR / sprint cycle, communication is unsatifactory, and the overall lack of accountabiulity seems to be the team's pattern rather than a slow start. 
+
+### Core Activities & Deliverables
+
+**Feature Completion:** Successfully merged the "Show detection rationale" toggle in Detection Settings (PR #63).
+
+**Security Validation:** Completed and unit-tested the Auth proxy identity-binding (Issue #94), ensuring the application correctly handles user identity via the proxy.
+
+**Authorization Scoping:** Defined a new OpenFGA/AuthZ epic (Issues #95–#100) to establish a more robust authorization control plane in future sprints.
+
+**Stale PR Audit:** Conducted a cleanup and integration of older PRs (#72, #57, #85) to reduce technical debt
+
 ---
 
 ## GitHub Project Board Review
@@ -45,14 +55,15 @@ Contribution imbalance continued for the third consecutive sprint: two of four t
 
 ### Not Completed:
 
-- **Issue #43** - Role-Based Authentication: Planned as the primary Sprint 3 feature (support for Admin, Compliance Officer, Developer, and Researcher roles with login/password, MongoDB-backed auth, and role-gated UI pages); assigned to Elijah Jenkins; no work started — carried forward to Sprint 4
+- **Issue #43** - Role-Based Authentication: Planned as the primary Sprint 3 feature (support for Admin, Compliance Officer, Developer, and Researcher roles with login/password, MongoDB-backed auth, and role-gated UI pages); assigned to Elijah Jenkins; no work started - carried forward to Sprint 4. 
 
 ### Scope Changes:
 
 The following items were added to the backlog at the end of Sprint 3 and were not in the original sprint plan:
 
-- **OpenFGA/AuthZ epic** — Five new issues (#96–#100) and one epic (#95) were created on 2026-03-22 to introduce OpenFGA as an authorization engine alongside Auth0 / oauth2-proxy authentication. Scope includes deploying OpenFGA + OpenFGA Studio, defining an authorization model for cards/sessions/audit exports/jobs/attestations, adding an OpenFGA client in Anonymous Studio, enforcing checks on sensitive actions, and building a stakeholder-facing demo flow.
-- **PR #101 (open) — Stale-PR audit and integration**: A batch integration PR was opened to assess all nine open PRs targeting `main`, integrate three clean ones (before/after sample display, session-to-card attachment, chart/metric CSS fixes), and close out stale or superseded PRs.
+- **OpenFGA/AuthZ epic**: five new issues (#96–#100) and one epic (#95) were created on 2026-03-22 to introduce OpenFGA as an authorization engine alongside Auth0 / oauth2-proxy authentication. Scope includes deploying OpenFGA + OpenFGA Studio, defining an authorization model for cards/sessions/audit exports/jobs/attestations, adding an OpenFGA client in Anonymous Studio, enforcing checks on sensitive actions, and building a stakeholder-facing demo flow.
+- 
+- **PR #101 (open) // Stale-PR audit and integration**: A batch integration PR was opened to assess all nine open PRs targeting `main`, integrate three clean ones (before/after sample display, session-to-card attachment, chart/metric CSS fixes), and close out stale or superseded PRs.
 
 Going forward, scope additions mid-sprint should be logged as Sprint 4 items immediately rather than being appended to the current sprint without capacity adjustments.
 
@@ -62,11 +73,14 @@ Going forward, scope additions mid-sprint should be logged as Sprint 4 items imm
 
 ### Planned vs. Completed Work
 
-Two of three planned items were completed. The primary planned feature — role-based authentication (issue #43) — was not started. The delivered items were a UI polish feature (rationale toggle, PR #63) and a devops validation item (auth proxy test, issue #94). The sprint was therefore significantly under-delivered against the plan.
+- Total Stories/Items: 14
+- Done: 13
+
+**In Progress:** The primary planned feature (role-based authentication [issue #43]) - was started but still very early into the auth work. The delivered items were a UI polish feature (rationale toggle, PR #63) and a devops validation item (auth proxy test, issue #94). The sprint was therefore significantly under-delivered against the plan.
 
 ### Revised Sprint Planning vs. Reality
 
-Sprint 3 was lighter than expected in both scope and delivery. The team added the OpenFGA epic at the end of the sprint, which is a meaningful architecture investment for Sprint 4, but it does not offset the failure to start the RBAC story that was the sprint's stated primary goal. The detection rationale toggle was a small, clean PR — the kind of task any team member could have taken on independently.
+Sprint 3 was lighter than expected in both scope and delivery. The team added the OpenFGA epic at the end of the sprint, which is a meaningful architecture investment for Sprint 4, but it does not offset the failure to start the RBAC story that was the sprint's stated primary goal. The detection rationale toggle was a small, clean PR task any team member could have taken on independently.
 
 The Sprint 2 action items (at least one merged PR per team member, weekly written status updates, closing issues when features ship) were not followed through for the third consecutive sprint. Issue #43 was assigned to Elijah Jenkins but received no activity during the sprint.
 
@@ -74,16 +88,28 @@ The Sprint 2 action items (at least one merged PR per team member, weekly writte
 
 Based on GitHub contributor data for this sprint:
 
-- Carley Fant: 1 direct commit (merged PR #63 on 2026-03-22) + initiated GitHub Copilot coding-agent sessions (PR #101 stale-PR audit, PR #102 sprint-3 retro, issues #95–#100 OpenFGA epic)
-- Diamond Hogans: 0 commits
+- Carley Fant: 1 direct squash/merge/commit (merged PR #63 on 2026-03-22) + initiated GitHub Copilot coding-agent sessions (PR #101 stale-PR audit, PR #102 sprint-3 retro, issues #95–#100 OpenFGA epic)
+- Diamond Hogans: 1 commit, 1 In Progress (oustanding RBAC work => Sprint 4)
 - Sakshi Patel: 0 commits
 - Elijah Jenkins: 0 commits
 
-**Three out of four team members made no direct code contributions this sprint.** This is the third consecutive sprint with this pattern. Diamond Hogans has a specific subtask in the RBAC issue (#43: "Build user registration/login interface") that was not touched. Elijah Jenkins was the assignee for issue #43 and took no action. Sakshi Patel has an open schema-design issue (#67) that was also inactive.
+**Two out of our four total team members have made no direct/indirect contributions to any aspects of the project.** 
+
+Considering this is the third consecutive sprint with this pattern, the energy required to continue attempted outreach or strategies for collaboration have been depleted.
+
+**- Carley & Diamond:** Specific subtask in RBAC issue (#43: "Build user registration/login interface") will carry over into Sprint 4. Will need to estimate level of effort for initial RBAC rollout & ensure robust AuthN/AuthZ documentation exists.
+
+**- Elijah Jenkins:** assignee for issue #43, zero work contributed to Sprint 3.
+**- Last Code Commit:** { N/A } 
+    
+**- Sakshi Patel has an open schema-design issue (#67, Sprint 2), zero work contributed to Sprint 3. 
+**- Last Code Commit:** { N/A }
 
 ### Task Scoping
 
-The detection rationale toggle (PR #63) and auth proxy validation (issue #94) were appropriately sized — both could have been taken on by any team member independently. Role-based authentication (issue #43) is larger, but its subtasks are individually scoped and could have been picked up in parallel. Sprint 4 must open with explicit per-person assignments for the OpenFGA epic.
+The detection rationale toggle (PR #63) and auth proxy validation (issue #94) were appropriately sized — both could have been taken on by any team member independently. Role-based authentication (issue #43) is larger, but its subtasks are individually scoped and will have be picked up in parallel for Sprint 4.
+
+**Note:** May consider explicit per-person assignments for the OpenFGA epic.
 
 ---
 
@@ -126,7 +152,7 @@ The detection rationale toggle (PR #63) and auth proxy validation (issue #94) we
 ## Individual Reflections
 
 **Carley Fant:**
-This sprint I merged the detection rationale toggle (PR #63), validated the auth proxy identity binding work, scoped the full OpenFGA/AuthZ epic into five trackable issues, and kicked off the stale-PR audit. The sprint was lighter than I wanted — the RBAC story should have landed. I opened the OpenFGA issues because a clear external authorization layer will make the demo much stronger for stakeholders, but I'm aware that I scoped that work without team input. For Sprint 4, my focus is on getting the rest of the team actively coding on these issues before I start driving Copilot sessions myself.
+This sprint's work merged the detection rationale toggle (PR #63), validated the auth proxy identity binding work, scoped the full OpenFGA/AuthZ epic into five trackable issues, and kicked off the stale-PR audit. The sprint was lighter on UI work but made up for it with permissions/role/relationship model complexities. OpenFGA introduces a clear external authorization layer which helps alleviate future challenges with integrations or scale ,  For Sprint 4, my focus is on getting the rest of the team actively coding on these issues before I start driving Copilot sessions myself.
 
 **Diamond Hogans:**
 \[Please add 2-4 sentences describing your activity this sprint. If you did not make any direct code contributions, please say so and describe one specific thing you plan to deliver in Sprint 4 — your subtask in issue #43 (Build user registration/login interface) is waiting.\]
