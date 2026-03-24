@@ -1,0 +1,18 @@
+# CODEOWNERS — automatically request reviews from the right people.
+# Each line maps a file pattern to one or more GitHub users / teams.
+# The *last* matching pattern takes precedence.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: require at least one team member to review every change.
+# More-specific patterns below override this for the files they match
+# (CODEOWNERS uses last-match-wins).
+*                       @cpsc4205-group3/anonymous-studio
+
+# Core application & PII engine — Lead Developer / Technical Architect
+presidio_streamlit.py   @51nk0r5w1m
+presidio_helpers.py     @51nk0r5w1m
+presidio_nlp_engine_config.py @51nk0r5w1m
+
+# CI / CD and GitHub configuration
+.github/                @51nk0r5w1m

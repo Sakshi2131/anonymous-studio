@@ -1,0 +1,22 @@
+Title	URL	Assignees	Status	Linked pull requests	Sub-issues progress
+As a team member, I want to view and manage data pipeline tasks on a Kanban board so that I can track the status of de-identification workflows	https://github.com/cpsc4205-group3/anonymous-studio/issues/6		Backlog		
+As a compliance officer, I want to schedule review appointments linked to pipeline cards so that I can coordinate PII attestation and approval activities	https://github.com/cpsc4205-group3/anonymous-studio/issues/7		Backlog		
+As a compliance officer, I want to export pipeline history and audit logs as CSV or JSON so that I can share compliance documentation with auditors	https://github.com/cpsc4205-group3/anonymous-studio/issues/9		Backlog		
+As a team member, I want to see a dashboard with pipeline summary statistics and upcoming reviews so that I can quickly understand project status	https://github.com/cpsc4205-group3/anonymous-studio/issues/10		Backlog		
+As a developer, I want to attach anonymized data files or results to pipeline cards so that compliance officers can review outputs directly	https://github.com/cpsc4205-group3/anonymous-studio/issues/11		Backlog		
+As a researcher, I want to detect PII in uploaded images so that I can anonymize visual data containing sensitive information	https://github.com/cpsc4205-group3/anonymous-studio/issues/12		Backlog		
+As a compliance officer, I want to receive notifications for upcoming reviews so that I don't miss scheduled compliance activities	https://github.com/cpsc4205-group3/anonymous-studio/issues/13		Backlog		
+As a developer, I want to access PII detection and pipeline management via REST API so that I can integrate with other systems	https://github.com/cpsc4205-group3/anonymous-studio/issues/14		Backlog		
+As an administrator, I want to view a log of all PII processing and attestation activities so that I can maintain compliance records for audits	https://github.com/cpsc4205-group3/anonymous-studio/issues/1	hogansD	Todo		
+As an administrator, I want users to log in with credentials and have role-based access so that only authorized personnel can access sensitive data and compliance features	https://github.com/cpsc4205-group3/anonymous-studio/issues/2	ejenkins0113	Todo		
+As a developer, I want to persist de-identified data, pipeline states, and audit logs in MongoDB so that application data is stored reliably and can be queried	https://github.com/cpsc4205-group3/anonymous-studio/issues/8	51nk0r5w1m	Todo		
+As a user, I want to create a new pipeline card so that I can track a dataset through de-identification stages	https://github.com/cpsc4205-group3/anonymous-studio/issues/15	51nk0r5w1m	Todo		
+As a user, I want to move a card across workflow stages so that I can reflect its processing state	https://github.com/cpsc4205-group3/anonymous-studio/issues/16	51nk0r5w1m	Todo		
+As a user, I want to save the results of a de-identification run so that I can reference it later in the workflow	https://github.com/cpsc4205-group3/anonymous-studio/issues/17		Todo		
+As a user, I want to attach a de-identification session to a pipeline card so that the card reflects the actual anonymization work performed	https://github.com/cpsc4205-group3/anonymous-studio/issues/18		Todo		
+As a user, I want to view the audit trail for a card so that I can verify all actions taken	https://github.com/cpsc4205-group3/anonymous-studio/issues/19	51nk0r5w1m	Todo		
+As a user, I want a table view of all cards so that I can filter and manage workload efficiently	https://github.com/cpsc4205-group3/anonymous-studio/issues/20		Todo		
+As a user, I want visual indicators for urgency and status so that I can quickly scan the board	https://github.com/cpsc4205-group3/anonymous-studio/issues/21		Todo		
+As a compliance officer, I want to upload CSV or text files containing sensitive data so that I can batch process multiple records for PII detection	https://github.com/cpsc4205-group3/anonymous-studio/issues/5	51nk0r5w1m	In Progress		
+As a developer, I want to paste or type text into the application and detect PII entities so that I can identify sensitive information before processing data	https://github.com/cpsc4205-group3/anonymous-studio/issues/3	51nk0r5w1m, Sakshi2131	In Review		
+As a data analyst, I want to anonymize detected PII using different methods so that I can safely share data while maintaining privacy compliance	https://github.com/cpsc4205-group3/anonymous-studio/issues/4	51nk0r5w1m	In Review		
