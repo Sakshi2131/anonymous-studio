@@ -5236,12 +5236,11 @@ def on_card_delete(state):
     notify(state, "success", "Card deleted.")
     _refresh_pipeline(state); _refresh_audit(state); _refresh_dashboard(state)
 
-
 def on_attest_open(state):
-    cid = _get_selected_card_id(state)
-    if not cid:
-        notify(state, "warning", "Select a card.")
-        return
+        cid = _get_selected_card_id(state)
+        if not cid:
+                notify(state, "warning", "Select a card.")
+                return
 
     state.attest_cid = cid
     state.attest_note = ""
