@@ -3,8 +3,8 @@
 <<<<<<< Updated upstream
 # ─── Shared Store Settings dialog (used by DASH and JOBS) ────────────────────
 _STORE_SETTINGS_DIALOG = """
-=======
 AUTH = """
+page = """
 <|part|class_name=pg pg-auth|
 
 <|part|class_name=page-hd|
@@ -23,6 +23,7 @@ AUTH = """
 <|{auth_password}|input|password=True|label=Password|class_name=fullwidth|>
 <|{auth_confirm_password}|input|password=True|label=Confirm Password|class_name=fullwidth|render={auth_mode=="Register"}|>
 <|{auth_role}|selector|lov={auth_role_lov}|dropdown=True|label=Role|class_name=fullwidth|render={auth_mode=="Register"}|>
+
 <|layout|columns=1 1|gap=8px|
 <|Sign In|button|on_action=on_auth_login|render={auth_mode=="Sign In"}|>
 <|Create Account|button|on_action=on_auth_register|render={auth_mode=="Register"}|>
@@ -30,7 +31,6 @@ AUTH = """
 <|Clear|button|on_action=on_auth_clear|class_name=secondary|>
 |>
 |>
-
 <|part|render={is_authenticated}|class_name=settings-panel|
 <|{auth_profile_md}|text|mode=md|class_name=audit-stmt|>
 <|{auth_access_md}|text|mode=md|class_name=inline-hint|>
@@ -41,6 +41,7 @@ AUTH = """
 |>
 
 |>
+"""
 """
 
 # ─── Dashboard ────────────────────────────────────────────────────────────────
