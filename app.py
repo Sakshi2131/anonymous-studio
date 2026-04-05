@@ -19,6 +19,12 @@ import os, re, time, warnings, tempfile, mimetypes
 
 from threading import Thread
 from services.notifications import send_email_notification
+from services.audit_log import create_log
+
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017/")
+db = client["anonymous_studio"]
 
 _log = logging.getLogger(__name__)
 from collections import Counter
@@ -6805,13 +6811,31 @@ def detect_pii(data: TextRequest):
     text = data.text
 
     if "@" in text:
+        create_log(
+            db,
+            actor="user",
+            action="pii_detected",
+            resource_type="text",
+            resource_id="input_text",
+            details="Email detected in input",
+            severity="warning"
+        )
+
         return {"message": "Possible email detected", "input": text}
+
+    create_log(
+        db,
+        actor="user",
+        action="pii_checked",
+        resource_type="text",
+        resource_id="input_text",
+        details="No PII detected",
+        severity="info"
+    )
 
     return {"message": "No PII detected", "input": text}
 
-@app.get("/pipeline-cards")
-def get_pipeline_cards():
-    return {"message": "Pipeline cards endpoint working"}
+
 
 pipeline_cards = []
 
@@ -6821,8 +6845,12 @@ class PipelineCard(BaseModel):
 
 @app.post("/pipeline-cards")
 def create_pipeline_card(card: PipelineCard):
-    pipeline_cards.append(card)
+    pipeline_cards.append(card.dict())
     return {"message": "Pipeline card created", "card": card}
+
+@app.get("/pipeline-cards")
+def get_pipeline_cards():
+        return pipeline_cards
 
 @app.put("/pipeline-cards/{index}")
 def update_pipeline_card(index: int, card: PipelineCard):
