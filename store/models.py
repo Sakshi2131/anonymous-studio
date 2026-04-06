@@ -37,13 +37,12 @@ def _now() -> str:
 
 
 def _uid() -> str:
-    """Short unique ID — 8-char hex prefix of a UUID4.
+    """Full UUID4 string used as the primary key for all domain models.
 
-    Long enough to be collision-free in practice for a single-tenant app.
     MongoStore note: MongoDB's ObjectId is NOT used; these string IDs are
     stored as ``_id`` directly so app code never needs to handle ObjectId.
     """
-    return str(uuid.uuid4())[:8]
+    return str(uuid.uuid4())
 
 
 # ── Domain Models ─────────────────────────────────────────────────────────────
@@ -134,6 +133,7 @@ class Appointment:
     pipeline_card_id: Optional[str]  = None
     status: str                      = "scheduled"  # scheduled|completed|cancelled
     created_at: str                  = field(default_factory=_now)
+    updated_at: str                  = field(default_factory=_now)
 
 
 @dataclass
@@ -157,3 +157,19 @@ class AuditEntry:
     resource_id: str   = ""
     details: str       = ""
     severity: str      = "info"  # info | warning | critical
+
+@dataclass
+class UserAccount:
+    """Application user record for local email/password authentication."""
+
+    id: str                      = field(default_factory=_uid)
+    email: str                   = ""
+    password_hash: str           = ""
+    role: str                    = "Researcher"
+    full_name: str               = ""
+    is_active: bool              = True
+    email_notifications: bool    = True
+    in_app_notifications: bool   = True
+    created_at: str              = field(default_factory=_now)
+    updated_at: str              = field(default_factory=_now)
+    last_login_at: Optional[str] = None

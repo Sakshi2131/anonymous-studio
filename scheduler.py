@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import schedule
 
@@ -80,6 +80,20 @@ def register(appt) -> bool:
 
     if due_dt <= datetime.now():
         return False  # already past
+
+    appt_id = appt.id    
+    from datetime import timedelta
+    reminder_dt = due_dt - timedelta(hours=24)
+
+    if reminder_dt > datetime.now():
+        reminder_time_str = reminder_dt.strftime("%H:%M")
+        reminder_date_str = reminder_dt.strftime("%Y-%m-%d")
+
+        def _reminder_job():
+            if datetime.now().strftime("%Y-%m-%d") == reminder_date_str:
+                _send_reminder(appt_id)
+            return schedule.CancelJob
+        schedule.every().day.at(reminder_time_str).do(_reminder_job)    
 
     cancel(appt.id)  # replace any existing job for this id
 
@@ -126,7 +140,7 @@ def sync(appointments) -> int:
     return count
 
 
-def start(interval_s: int = 30) -> threading.Thread:
+def start(interval_s: int = 30) -> Optional[threading.Thread]:
     """Start the background runner thread (idempotent — safe to call twice).
 
     *interval_s* controls how often ``schedule.run_pending()`` is called.
@@ -134,7 +148,7 @@ def start(interval_s: int = 30) -> threading.Thread:
     """
     global _started
     if _started:
-        return None  # type: ignore[return-value]
+        return None
     _started = True
 
     def _run():
@@ -191,5 +205,46 @@ def _fire(appt_id: str) -> None:
     with _pending_lock:
         _PENDING.append({
             "level": "info",
-            "msg":   f"📅 Review due: {a.title}",
+            "msg":   f"Review due: {a.title}",
         })
+
+def _send_reminder(appt_id: str) -> None:
+    from store import get_store
+    from services.notifications import send_email_notification
+    store = get_store()
+    a = store.get_appointment(appt_id)
+
+    if not a:
+        return
+    #Getting Pipeline Card Information
+    card_info = ""
+    if a.pipeline_card_id:
+        card = store.get_card(a.pipeline_card_id)
+        if card:
+            card_info = f"\nPipeline Card: {card.title} (Status: {card.status})"
+    message = f"""
+Reminder: {a.title}
+
+Description: {a.description}
+Scheduled for: {a.scheduled_for}
+{card_info}
+"""
+    #Email
+    for email in a.attendees:
+        if not email:
+            continue
+        user = None
+        try:
+            user = store.get_user_by_email(email)
+        except Exception:
+            pass
+
+        if not user or getattr(user, "email_notifications", True):
+            send_email_notification(email, f"Upcoming Reminder (Review in 24 Hours)", message)
+        
+    #IN App
+    with _pending_lock:
+        _PENDING.append({
+            "level": "info",
+            "msg": f"Reminder: {a.title} in 24 hours"
+        })    

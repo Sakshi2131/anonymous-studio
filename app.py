@@ -14,8 +14,16 @@ import dataclasses
 import json
 import numbers
 import logging
-import os, re, time, warnings, tempfile
+import scheduler
+import os, re, time, warnings, tempfile, mimetypes
+
 from threading import Thread
+from services.notifications import send_email_notification
+
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017/")
+db = client["anonymous_studio"]
 
 _log = logging.getLogger(__name__)
 from collections import Counter
@@ -23,6 +31,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
 load_dotenv()  # load .env before any os.environ reads (no-op if file absent)
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="spacy")
@@ -30,12 +39,14 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 warnings.filterwarnings("ignore", message="urllib3.*", category=UserWarning)
 
 import pandas as pd
+from presidio_analyzer import AnalyzerEngine
+
 try:
     import plotly.graph_objects as go
 except Exception:  # optional: fallback if plotly is unavailable in env
     go = None
 import taipy as tp
-from taipy.gui import Gui, notify, invoke_callback, invoke_long_callback, download, get_state_id, navigate, Icon
+from taipy.gui import Gui, notify, invoke_callback, download, get_state_id, navigate, Icon
 import taipy.core as tc
 from taipy.core import Status
 from taipy.event import EventProcessor
@@ -64,7 +75,17 @@ from pii_engine import (
     highlight_md,
 )
 from pages import PAGES
-from ui.theme import CHART_LAYOUT, DASH_STYLEKIT, MONO_COLORWAY
+from ui.theme import (
+    CHART_LAYOUT,
+    COLOR_ERROR,
+    COLOR_INFO,
+    COLOR_PRIMARY,
+    COLOR_SUCCESS,
+    COLOR_WARN,
+    DASH_STYLEKIT,
+    GEO_DARK_SCALE,
+    MONO_COLORWAY,
+)
 from services.jobs import (
     all_jobs_done_like,
     build_entity_stats_df,
@@ -95,6 +116,15 @@ from services.attestation_crypto import (
     sign_attestation_payload,
     signature_required,
 )
+from services.auth_identity import bind_identity_from_request_headers
+from services.authz import authz_check, principal_for
+from services.telemetry import (
+    record_job_completion,
+    get_telemetry_snapshot,
+    get_recent_events,
+)
+from services.local_auth import VALID_ROLES, authenticate_user, register_user
+
 from services.synthetic import SyntheticConfig, synthesize_from_anonymized_text
 
 store  = get_store()
@@ -164,13 +194,65 @@ def _drunken_bishop(hex_str: str, label: str = "") -> str:
     return "\n".join(rows)
 
 
+_PERSP_CDN = "https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@3/dist/cdn"
+_PERSP_PSP = "https://cdn.jsdelivr.net/npm/@finos/perspective@3/dist/cdn"
+
+
+def _build_perspective_html(df: "pd.DataFrame") -> str:
+    """Return an iframe-srcdoc Perspective viewer for the given DataFrame (≤5000 rows)."""
+    import html as _esc
+    import json
+    import math
+
+    preview = df.head(5_000)
+
+    def _clean(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return v
+
+    rows = [{k: _clean(v) for k, v in row.items()} for row in preview.to_dict(orient="records")]
+    data_js = json.dumps(rows)
+    n_rows = len(rows)
+    n_cols = len(preview.columns)
+
+    inner = f"""<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="{_PERSP_CDN}/themes/pro-dark.css">
+  <style>
+    html,body{{margin:0;padding:0;height:100%;background:#0b0c0f;overflow:hidden;}}
+    perspective-viewer{{width:100%;height:100%;display:block;}}
+  </style>
+  <script type="module">
+    import perspective from "{_PERSP_PSP}/perspective.js";
+    import "{_PERSP_CDN}/perspective-viewer.js";
+    import "{_PERSP_CDN}/perspective-viewer-datagrid.js";
+    import "{_PERSP_CDN}/perspective-viewer-d3fc.js";
+    const worker = await perspective.worker();
+    const table  = await worker.table({data_js});
+    const viewer = document.querySelector("perspective-viewer");
+    await viewer.load(table);
+    await viewer.restore({{plugin:"Datagrid",theme:"Pro Dark"}});
+  </script>
+</head><body>
+  <perspective-viewer></perspective-viewer>
+</body></html>"""
+
+    srcdoc = _esc.escape(inner, quote=True)
+    note = f"{n_rows:,} rows · {n_cols} cols · first 5 000 shown" if len(df) > n_rows else f"{n_rows:,} rows · {n_cols} cols"
+    return (
+        f'<div style="font-size:11px;color:#4d5873;margin-bottom:6px;">{note}</div>'
+        f'<iframe srcdoc="{srcdoc}" style="width:100%;height:620px;border:none;border-radius:2px;" loading="lazy"></iframe>'
+    )
+
+
 def _store_status_ui(status_text: str) -> tuple[str, str]:
-    """Return compact store label plus full hover tooltip text."""
     raw = str(status_text or "").strip()
     lower = raw.lower()
-    if lower.startswith("✓ mongodb"):
+    if lower.startswith("mongodb"):
         label = "𖠰 Mongo"
-    elif lower.startswith("✓ duckdb"):
+    elif lower.startswith("duckdb"):
         label = "𐦖 DuckDB"
     else:
         label = "⸙ In Memory"
@@ -219,6 +301,85 @@ def _priority_to_severity(priority: str) -> str:
     return {"critical": "critical", "high": "warning"}.get(str(priority).lower(), "info")
 
 
+def _get_user_label(state) -> str:
+    return str(getattr(state, "current_user_name", "") or getattr(state, "current_user_email", "") or "Unknown User")
+
+
+def _is_authenticated(state) -> bool:
+    return bool(getattr(state, "is_authenticated", False) and getattr(state, "current_user_role", ""))
+
+
+def _menu_for_role(role: str, is_authenticated_flag: bool) -> List[tuple[str, Icon]]:
+    if not is_authenticated_flag:
+        return [("auth", Icon("images/audit.svg", "Access"))]
+    allowed_pages = [page for page, roles in PAGE_ROLE_RULES.items() if role in roles and page != "auth"]
+    return [item for item in BASE_MENU_LOV if item[0] in allowed_pages]
+
+
+def _can_access_page(state, page: str) -> bool:
+    if page == "auth":
+        return True
+    if not _is_authenticated(state):
+        return False
+    return getattr(state, "current_user_role", "") in PAGE_ROLE_RULES.get(page, set())
+
+
+def _sync_auth_ui(state) -> None:
+    state.menu_lov = _menu_for_role(str(getattr(state, "current_user_role", "")), _is_authenticated(state))
+    if _is_authenticated(state):
+        state.auth_profile_md = (
+            f"Signed in as **{_get_user_label(state)}**  \n"
+            f"Email: `{state.current_user_email}`  \n"
+            f"Role: **{state.current_user_role}**"
+        )
+        allowed_pages = [page for page, roles in PAGE_ROLE_RULES.items() if page != "auth" and state.current_user_role in roles]
+        state.auth_access_md = "Accessible pages: " + ", ".join(page.replace("_", " ").title() for page in allowed_pages)
+    else:
+        state.auth_profile_md = "Not signed in."
+        state.auth_access_md = ""
+
+
+def _clear_auth_form(state) -> None:
+    state.auth_email = ""
+    state.auth_password = ""
+    state.auth_confirm_password = ""
+    state.auth_full_name = ""
+    state.auth_role = "Researcher"
+
+
+def _set_authenticated_user(state, user) -> None:
+    state.is_authenticated = True
+    state.current_user_id = user.id
+    state.current_user_email = user.email
+    state.current_user_name = user.full_name or user.email
+    state.current_user_role = user.role
+    state.email_notifications = getattr(user, "email_notifications", True)
+    state.in_app_notifications = getattr(user, "in_app_notifications", True)
+    _sync_auth_ui(state)
+
+
+def _clear_authenticated_user(state) -> None:
+    state.is_authenticated = False
+    state.current_user_id = ""
+    state.current_user_email = ""
+    state.current_user_name = ""
+    state.current_user_role = ""
+    _sync_auth_ui(state)
+
+
+def _require_action_role(state, action: str, feature_label: str) -> bool:
+    allowed_roles = ACTION_ROLE_RULES.get(action, set())
+    if not _is_authenticated(state):
+        notify(state, "warning", "Please sign in first.")
+        navigate(state, "auth")
+        return False
+    if allowed_roles and getattr(state, "current_user_role", "") not in allowed_roles:
+        notify(state, "error", f"{feature_label} is restricted for the {state.current_user_role} role.")
+        return False
+    return True
+
+
+
 def _normalize_geo_token(value: Any) -> str:
     """Compatibility wrapper around geo helper module."""
     return normalize_geo_token_base(value)
@@ -260,6 +421,10 @@ def _geo_city_view(lat_values: List[float], lon_values: List[float]) -> Dict[str
         "zoom": round(zoom, 2),
     }
 
+# Demo mode: auto-login with role switcher when ANON_MODE=development (default).
+# No email/password required — lets the whole team explore permission differences.
+_DEMO_MODE: bool = (os.environ.get("ANON_MODE", "development") or "development").strip().lower() == "development"
+
 # Standalone security note only when raw_input explicitly uses pickle backend.
 if os.environ.get("ANON_MODE", "development") == "standalone":
     _raw_backend = (os.environ.get("ANON_RAW_INPUT_BACKEND", "auto") or "auto").strip().lower()
@@ -280,15 +445,65 @@ if os.environ.get("ANON_MODE", "development") == "standalone":
 # ── Navigation ────────────────────────────────────────────────────────────────
 active_page = "dashboard"
 
-menu_lov = [
+BASE_MENU_LOV = [
+    ("auth",      Icon("images/audit.svg",      "Access")),
     ("dashboard", Icon("images/dashboard.svg", "Dashboard")),
     ("analyze",   Icon("images/piitext.svg",   "Analyze Text")),
     ("jobs",      Icon("images/jobs.svg",       "Batch Jobs")),
     ("pipeline",  Icon("images/pipeline.svg",   "Pipeline")),
     ("schedule",  Icon("images/schedule.svg",   "Reviews")),
     ("audit",     Icon("images/audit.svg",      "Audit Log")),
+    ("telemetry", Icon("images/dashboard.svg",  "Telemetry")),
     ("ui_demo",   Icon("images/dashboard.svg",  "UI")),
+    ("settings",  Icon("images/settings.svg",   "Settings")),
 ]
+menu_lov = [("auth", Icon("images/audit.svg", "Access"))]
+
+PAGE_ROLE_RULES: Dict[str, set[str]] = {
+    "auth": set(VALID_ROLES),
+    "dashboard": set(VALID_ROLES),
+    "settings": set(VALID_ROLES),
+    "analyze": set(VALID_ROLES),
+    "jobs": {"Admin", "Compliance Officer", "Developer"},
+    "pipeline": {"Admin", "Compliance Officer", "Developer"},
+    "schedule": {"Admin", "Compliance Officer"},
+    "audit": {"Admin", "Compliance Officer"},
+    "ui_demo": {"Admin", "Compliance Officer", "Developer"},
+}
+
+ACTION_ROLE_RULES: Dict[str, set[str]] = {
+    "audit_export": {"Admin", "Compliance Officer"},
+    "pipeline_export": {"Admin", "Compliance Officer", "Developer"},
+    "appointment_manage": {"Admin", "Compliance Officer"},
+    "card_manage": {"Admin", "Compliance Officer", "Developer"},
+    "card_attest": {"Admin", "Compliance Officer"},
+    "job_submit": {"Admin", "Compliance Officer", "Developer"},
+    "demo_seed": {"Admin", "Compliance Officer", "Developer"},
+}
+
+auth_mode = "Sign In"
+auth_mode_lov = ["Sign In", "Register"]
+auth_email = ""
+auth_password = ""
+auth_confirm_password = ""
+auth_full_name = ""
+auth_role = "Researcher"
+auth_role_lov = list(VALID_ROLES)
+auth_status_md = ""
+auth_profile_md = "Not signed in."
+auth_access_md = ""
+is_authenticated = False
+current_user_id = ""
+current_user_email = ""
+current_user_name = ""
+current_user_role = ""
+email_notifications: bool = True
+in_app_notifications: bool = True
+
+# Demo mode state — populated in on_init when _DEMO_MODE is True
+is_demo_mode: bool = _DEMO_MODE
+demo_role: str = "Admin"
+demo_role_lov: list = list(VALID_ROLES)
 
 # ── Quick-text PII (inline mode, no file upload needed) ──────────────────────
 spacy_status = get_spacy_model_status()
@@ -300,16 +515,16 @@ store_status_label, store_status_hover = _store_status_ui(store_status)
 raw_input_status_label, raw_input_status_hover = _raw_input_backend_ui()
 # Bool companions for <|status|> LED widgets
 spacy_ok      = "blank" not in spacy_status.lower()
-store_ok      = store_status.startswith("✓")
+store_ok      = not store_status.startswith("Error") and not store_status.startswith("Missing") and not store_status.startswith("⚠") and not store_status.startswith("Fallback")
 raw_input_ok  = True
 
 try:
     import dask as _dask_mod
     dask_version = _dask_mod.__version__
-    dask_status  = f"✓ Dask {dask_version}"
+    dask_status  = f"Dask {dask_version}"
 except ImportError:
     dask_version = ""
-    dask_status  = "✗ Dask not installed"
+    dask_status  = "Dask not installed"
 
 # ── Store backend settings ────────────────────────────────────────────────────
 _initial_store_backend = get_store_backend_mode()
@@ -437,6 +652,10 @@ download_scenario_id = ""
 download_rows        = 0
 download_cols        = 0
 
+# Perspective viewer (CDN iframe)
+persp_html  = ""
+persp_ready = False
+
 # Preview table (first 50 rows of result)
 preview_data       = pd.DataFrame()
 preview_cols: List[str]  = []
@@ -459,7 +678,7 @@ job_processed_text = "0 / 0 rows"
 job_active_started = 0.0
 job_adv_open       = False
 job_view_tab       = "Results"
-job_view_tab_lov   = ["Results", "Job History", "Data Nodes", "Errors / Audit"]
+job_view_tab_lov   = ["Results", "Job History", "Data Nodes", "Errors", "Orchestration"]
 orchestration_scenario = None
 orchestration_job      = None
 ops_status_items: List[str] = ["Run health: Idle", "Submission: —", "Store: —"]
@@ -504,7 +723,153 @@ except Exception:
 # Keyed by get_state_id(state) so concurrent users never share each other's uploads.
 _FILE_CACHE = APP_CTX.file_cache
 _BURNDOWN_CACHE = APP_CTX.burndown_cache
+_STATS_CACHE = APP_CTX.stats_cache
+_SESSIONS_CACHE = APP_CTX.sessions_cache
+try:
+    _DASH_CACHE_TTL_SEC = max(0.0, float(os.environ.get("ANON_DASH_CACHE_TTL_SEC", "5") or "5"))
+except Exception:
+    _DASH_CACHE_TTL_SEC = 5.0
 
+
+# ── Card attachments (Issue #47) ─────────────────────────────────────────────
+ATTACHMENTS_DIR = os.path.join(tempfile.gettempdir(), "anon_studio_attachments")
+ATTACHMENTS_MANIFEST = os.path.join(ATTACHMENTS_DIR, "card_attachments_manifest.json")
+CARD_ATTACHMENT_COLS = ["id", "Name", "Kind", "Size", "Added", "Download"]
+
+
+def _ensure_attachments_dir():
+    os.makedirs(ATTACHMENTS_DIR, exist_ok=True)
+
+
+def _load_attachment_manifest():
+    _ensure_attachments_dir()
+    if not os.path.exists(ATTACHMENTS_MANIFEST):
+        return {}
+    try:
+        with open(ATTACHMENTS_MANIFEST, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_attachment_manifest(data):
+    _ensure_attachments_dir()
+    with open(ATTACHMENTS_MANIFEST, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _format_size(num_bytes):
+    try:
+        size = int(num_bytes or 0)
+    except Exception:
+        size = 0
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    else:
+        return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _list_card_attachments(card_id):
+    manifest = _load_attachment_manifest()
+    return manifest.get(card_id, [])
+
+
+def _attachment_exists(card_id, source_ref):
+    for rec in _list_card_attachments(card_id):
+        if rec.get("source_ref") == source_ref:
+            return True
+    return False
+
+
+def _store_attachment_record(card_id, display_name, saved_name, kind, size_bytes, mime_type="", source_ref=""):
+    manifest = _load_attachment_manifest()
+    record = {
+        "id": _uid(),
+        "card_id": card_id,
+        "display_name": display_name,
+        "saved_name": saved_name,
+        "kind": kind,
+        "size_bytes": size_bytes,
+        "mime_type": mime_type,
+        "created_at": _now(),
+        "source_ref": source_ref,
+    }
+    manifest.setdefault(card_id, []).append(record)
+    _save_attachment_manifest(manifest)
+    return record
+
+
+def _write_attachment_bytes(card_id, content, filename, kind="file", mime_type="", source_ref=""):
+    _ensure_attachments_dir()
+
+    safe_name = secure_filename(filename)
+    ext = os.path.splitext(safe_name)[1]
+    saved_name = f"{card_id[:8]}_{_uid()}{ext}"
+    full_path = os.path.join(ATTACHMENTS_DIR, saved_name)
+
+    with open(full_path, "wb") as f:
+        f.write(content)
+
+    return _store_attachment_record(
+        card_id,
+        safe_name,
+        saved_name,
+        kind,
+        len(content),
+        mime_type or "application/octet-stream",
+        source_ref,
+    )
+
+
+def _attach_text_output_to_card(card_id, text, filename, source_ref=""):
+    return _write_attachment_bytes(
+        card_id,
+        text.encode("utf-8"),
+        filename,
+        kind="text_output",
+        mime_type="text/plain",
+        source_ref=source_ref,
+    )
+
+
+def _find_attachment_record(attachment_id):
+    manifest = _load_attachment_manifest()
+    for records in manifest.values():
+        for rec in records:
+            if rec.get("id") == attachment_id:
+                return rec
+    return None
+
+
+def _delete_card_attachments(card_id):
+    manifest = _load_attachment_manifest()
+    records = manifest.pop(card_id, [])
+
+    for rec in records:
+        path = os.path.join(ATTACHMENTS_DIR, rec.get("saved_name", ""))
+        if os.path.exists(path):
+            os.remove(path)
+
+    _save_attachment_manifest(manifest)
+
+
+def _refresh_card_attachments(state, card_id):
+    records = _list_card_attachments(card_id)
+
+    rows = []
+    for rec in records:
+        rows.append({
+            "id": rec["id"],
+            "Name": rec["display_name"],
+            "Kind": rec["kind"],
+            "Size": _format_size(rec["size_bytes"]),
+            "Added": rec["created_at"][:16],
+            "Download": "Download",
+        })
+
+    state.card_attachments_data = pd.DataFrame(rows, columns=CARD_ATTACHMENT_COLS)
 
 def _progress_from_sources(job_id: str) -> Dict[str, Any]:
     """Get the freshest progress payload from in-memory and durable snapshot."""
@@ -528,7 +893,8 @@ def _register_live_state(state) -> None:
 def _on_live_dashboard_tick(state) -> None:
     """UI-thread callback invoked periodically for each connected client."""
     try:
-        _refresh_dashboard(state)
+        if not _sync_active_job_progress(state, load_results_on_done=True):
+            _refresh_dashboard(state)
     except Exception:
         pass
 
@@ -607,6 +973,8 @@ in_progress_sel  = []
 review_sel       = []
 done_sel         = []
 pipeline_all_sel = []
+pipeline_export_status_filter: str = "All"
+pipeline_export_status_filter_lov: list = ["All", "backlog", "in_progress", "review", "done"]
 card_form_open = False
 card_id_edit   = ""
 card_title_f   = ""
@@ -627,12 +995,19 @@ card_session_opts: List[str] = ["(none)"]  # populated on form open
 attest_open   = False
 attest_cid    = ""
 attest_note   = ""
-attest_by     = ""
+attest_by     = ""   # legacy — kept for Taipy state binding only; not used in attestation logic
+# Authenticated GUI identity — populated in on_init from trusted proxy headers
+gui_user        = ""
+gui_user_email  = ""
+gui_user_groups = ""
+gui_auth_identity = ""
+gui_auth_source = "unauthenticated"  # "proxy" | "break_glass" | "unauthenticated"
 
 # Per-card audit history dialog
 card_audit_open = False
 card_audit_data = pd.DataFrame(columns=["Time", "Action", "Actor", "Details"])
 card_sessions_data = pd.DataFrame(columns=["ID", "Title", "Operator", "Entities", "Source", "Created"])
+card_attachments_data = pd.DataFrame(columns=CARD_ATTACHMENT_COLS)
 
 # ── Schedule ──────────────────────────────────────────────────────────────────
 appt_table     = pd.DataFrame(columns=["id", "Title", "Date / Time", "Duration", "Attendees", "Linked Card", "Status"])
@@ -704,6 +1079,7 @@ dash_report_summary_md = ""
 dash_kpi_entities_total = 0
 dash_kpi_entities_total_label = "0"
 dash_kpi_reviews_scheduled = 0
+dash_kpi_sessions_total    = 0
 dash_audit_chart = pd.DataFrame(columns=["Severity", "Count"])
 dash_priority_chart = pd.DataFrame(columns=["Priority", "Count"])
 dash_ops_trend = pd.DataFrame(columns=["Date", "Entities", "Sessions"])
@@ -714,16 +1090,36 @@ dash_priority_chart_visible = False
 dash_ops_trend_visible = False
 dash_map_visible = False
 dash_map_md = ""
+dash_alerts_md = ""
+dash_alerts_visible = False
+dash_svc_health_md = ""
 
 # Engine Performance panel (populated by _refresh_dashboard from session timing)
 # Numeric types are required by the native Taipy metric / indicator widgets.
 dash_perf_visible        = False
 dash_perf_avg_ms         = 0.0    # <|...|metric|> — avg processing latency
+dash_perf_peak_ms        = 0.0    # <|...|metric|> — peak (max) processing latency
 dash_perf_max_ms         = 50.0   # gauge upper bound, updated to 120 % of peak
 dash_perf_delta_ms       = 0.0    # latest session vs avg — negative = faster
 dash_perf_count          = 0      # <|...|metric|> — total timed sessions
 dash_perf_figure         = {}
 perf_telemetry_table     = pd.DataFrame(columns=["Session", "ms"])
+
+# ── Telemetry page ────────────────────────────────────────────────────────────
+telemetry_kpi_jobs_created  = 0
+telemetry_kpi_completed     = 0
+telemetry_kpi_failed        = 0
+telemetry_kpi_entities      = 0
+telemetry_kpi_rows          = 0
+telemetry_kpi_scenarios     = 0
+telemetry_duration_avg      = 0.0
+telemetry_duration_p95      = 0.0
+telemetry_duration_count    = 0
+telemetry_prometheus_status = "—"
+telemetry_event_table       = pd.DataFrame(columns=["Time", "Entity", "Operation", "Attribute", "Value", "ID"])
+telemetry_lifecycle_figure  = {}
+telemetry_data_figure       = {}
+telemetry_last_refresh      = "—"
 
 # ── UI (Taipy + Plotly showcase over live app data) ──────────────────────────
 ui_demo_mode = "All"
@@ -1308,6 +1704,86 @@ def _refresh_audit(state):
     state.audit_table = pd.DataFrame(rows, columns=["Time", "Actor", "Action", "Resource", "Details", "Severity"])
 
 
+def _refresh_telemetry(state) -> None:
+    """Rebuild all telemetry page state from the in-process snapshot."""
+    snap = get_telemetry_snapshot()
+    state.telemetry_kpi_jobs_created = snap.get("jobs_created", 0)
+    state.telemetry_kpi_completed    = snap.get("jobs_completed", 0)
+    state.telemetry_kpi_failed       = snap.get("jobs_failed", 0)
+    state.telemetry_kpi_entities     = snap.get("entities_detected", 0)
+    state.telemetry_kpi_rows         = snap.get("rows_processed", 0)
+    state.telemetry_kpi_scenarios    = snap.get("scenarios_created", 0)
+    state.telemetry_duration_avg     = float(snap.get("duration_avg_s") or 0.0)
+    state.telemetry_duration_p95     = float(snap.get("duration_p95_s") or 0.0)
+    state.telemetry_duration_count   = int(snap.get("duration_count", 0) or 0)
+
+    prom_ok = snap.get("prometheus_available", False)
+    port    = snap.get("metrics_port", 0)
+    if prom_ok and port > 0:
+        state.telemetry_prometheus_status = f"Prometheus active — /metrics on :{port}"
+    elif prom_ok:
+        state.telemetry_prometheus_status = "prometheus_client installed · set ANON_METRICS_PORT to expose /metrics"
+    else:
+        state.telemetry_prometheus_status = "▲ prometheus_client not installed — install with: pip install prometheus_client"
+
+    # ── Recent events table ──────────────────────────────────────────────────
+    events = get_recent_events(limit=100)
+    if events:
+        rows = [
+            {
+                "Time":      e.get("ts", "")[-8:],
+                "Entity":    e.get("entity_type", ""),
+                "Operation": e.get("operation", ""),
+                "Attribute": e.get("attribute", ""),
+                "Value":     e.get("value", "")[:30],
+                "ID":        e.get("entity_id", ""),
+            }
+            for e in reversed(events)
+        ]
+        state.telemetry_event_table = pd.DataFrame(rows)
+    else:
+        state.telemetry_event_table = pd.DataFrame(
+            columns=["Time", "Entity", "Operation", "Attribute", "Value", "ID"]
+        )
+
+    # ── Job lifecycle bar chart ──────────────────────────────────────────────
+    if go is not None:
+        created   = snap.get("jobs_created", 0)
+        running   = snap.get("jobs_running", 0)
+        completed = snap.get("jobs_completed", 0)
+        failed    = snap.get("jobs_failed", 0)
+        canceled  = snap.get("jobs_canceled", 0)
+        fig_lc = go.Figure(
+            data=[go.Bar(
+                x=["Created", "Running", "Completed", "Failed", "Canceled"],
+                y=[created, running, completed, failed, canceled],
+                marker_color=[COLOR_PRIMARY, COLOR_WARN, COLOR_SUCCESS, COLOR_ERROR, COLOR_INFO],
+            )],
+            layout={**CHART_LAYOUT, "title": {"text": "Job Lifecycle Counts", "font": {"size": 13}}},
+        )
+        state.telemetry_lifecycle_figure = fig_lc.to_dict()
+
+        # ── Data throughput chart ────────────────────────────────────────────
+        fig_data = go.Figure(
+            data=[go.Bar(
+                x=["Entities Detected", "Rows Processed", "Scenarios"],
+                y=[
+                    snap.get("entities_detected", 0),
+                    snap.get("rows_processed", 0),
+                    snap.get("scenarios_created", 0),
+                ],
+                marker_color=[COLOR_PRIMARY, COLOR_INFO, COLOR_WARN],
+            )],
+            layout={**CHART_LAYOUT, "title": {"text": "Data Throughput (cumulative)", "font": {"size": 13}}},
+        )
+        state.telemetry_data_figure = fig_data.to_dict()
+    else:
+        state.telemetry_lifecycle_figure = {}
+        state.telemetry_data_figure = {}
+
+    state.telemetry_last_refresh = datetime.now().strftime("%H:%M:%S")
+
+
 def severity_cell_class(state, value, index, row, column_name):
     sev = str(value or "").strip().lower()
     if sev == "info":
@@ -1680,7 +2156,8 @@ def _refresh_job_health(state):
         state.job_run_health = "Running"
 
     submission = _resolve_submission_state(jid)
-    state.job_active_submission_id = str(submission.get("id", "") or "")
+    raw_sub_id = str(submission.get("id", "") or "")
+    state.job_active_submission_id = raw_sub_id[:16] + "…" if len(raw_sub_id) > 16 else raw_sub_id
     sub_status = str(submission.get("status", "—") or "—")
     if sub_status == "—" and state.job_is_running:
         sub_status = "Submitting"
@@ -1855,6 +2332,30 @@ def _refresh_dashboard_displays(state, by_s: Dict[str, int]) -> None:
     )
 
 
+def _cached_stats() -> Dict[str, Any]:
+    """Return store.stats() from in-process TTL cache (default TTL 5 s)."""
+    now = time.monotonic()
+    if _STATS_CACHE["data"] is None or (now - _STATS_CACHE["ts"]) > _DASH_CACHE_TTL_SEC:
+        _STATS_CACHE["data"] = store.stats()
+        _STATS_CACHE["ts"] = now
+    return _STATS_CACHE["data"]
+
+
+def _cached_sessions() -> list:
+    """Return store.list_sessions() from in-process TTL cache (default TTL 5 s)."""
+    now = time.monotonic()
+    if _SESSIONS_CACHE["data"] is None or (now - _SESSIONS_CACHE["ts"]) > _DASH_CACHE_TTL_SEC:
+        _SESSIONS_CACHE["data"] = list(store.list_sessions())
+        _SESSIONS_CACHE["ts"] = now
+    return _SESSIONS_CACHE["data"]
+
+
+def _invalidate_store_caches() -> None:
+    """Force next dashboard refresh to re-query the store (call after writes)."""
+    _STATS_CACHE["ts"] = 0.0
+    _SESSIONS_CACHE["ts"] = 0.0
+
+
 def _refresh_dashboard(state):
     def _parse_dt(value: Any) -> Optional[datetime]:
         if isinstance(value, datetime):
@@ -1897,23 +2398,29 @@ def _refresh_dashboard(state):
         except Exception:
             return False
 
-    st = store.stats()
+    st = _cached_stats()
     prev_completion_pct = int(getattr(state, "dash_completion_pct", 0) or 0)
     prev_inflight_cards = int(getattr(state, "dash_inflight_cards", 0) or 0)
     prev_backlog_cards = int(getattr(state, "dash_backlog_cards", 0) or 0)
-    _dash_sessions = store.list_sessions()   # hoist — reused by entity chart, trend, perf panel
+    _dash_sessions = _cached_sessions()   # hoist — reused by entity chart, trend, perf panel
     state.dash_cards_total    = sum(st["pipeline_by_status"].values())
     state.dash_cards_attested = st["attested_cards"]
-    state.dash_kpi_entities_total = st.get("total_entities_redacted", 0)
-    state.dash_kpi_reviews_scheduled = len([
-        a for a in store.list_appointments() if a.status == "scheduled"
-    ])
+    state.dash_kpi_entities_total  = st.get("total_entities_redacted", 0)
+    state.dash_kpi_sessions_total  = len(_dash_sessions)
+    _dash_appointments = store.list_appointments()  # hoist — reused for KPI, upcoming, alerts
+    _now_iso = _now()
+    state.dash_kpi_reviews_scheduled = sum(
+        1 for a in _dash_appointments if a.status == "scheduled"
+    )
     all_jobs = tc.get_jobs()
     state.dash_jobs_total   = len(_SCENARIOS)
     state.dash_jobs_running = sum(1 for j in all_jobs if j.status == Status.RUNNING)
     state.dash_jobs_done    = sum(1 for j in all_jobs if j.status == Status.COMPLETED)
     state.dash_jobs_failed  = sum(1 for j in all_jobs if j.status == Status.FAILED)
-    upcoming = store.upcoming_appointments(4)
+    upcoming = sorted(
+        [a for a in _dash_appointments if a.status == "scheduled" and a.scheduled_for >= _now_iso],
+        key=lambda a: a.scheduled_for,
+    )[:4]
     html = []
     import html as _html
     for a in upcoming:
@@ -2217,7 +2724,6 @@ def _refresh_dashboard(state):
                     color=state.dash_map_chart["Mentions"],
                     colorscale=geo_scale,
                     opacity=0.94,
-                    line=dict(color="#FFF8F2", width=1.8),
                     colorbar=dict(
                         title=dict(text="Mentions", font=dict(color=map_text)),
                         x=1.02,
@@ -2292,44 +2798,65 @@ def _refresh_dashboard(state):
         state.dash_perf_count    = len(timing_ms)
         state.dash_perf_max_ms   = max(50.0, round(max(timing_ms) * 1.2, 0))
 
-        # Bar chart — last 12 sessions, processing time per session
-        recent   = timing_sessions[-12:]
-        raw_labels = [getattr(s, "title", s.id[:8]) for s in recent]
-        labels   = [lbl[:14] + "…" if len(lbl) > 14 else lbl for lbl in raw_labels]
-        values   = [round(s.processing_ms, 1) for s in recent]
+        # Horizontal bar chart — last 12 sessions, most recent at top
+        recent     = timing_sessions[-12:]
+        raw_titles = [getattr(s, "title", s.id[:8]) for s in recent]
+        values     = [round(s.processing_ms, 1) for s in recent]
+        # Truncate long session titles for display; full title surfaced in hover
+        labels = [t[:18] + "…" if len(t) > 18 else t for t in raw_titles]
+        hovers = [f"<b>{t}</b><br>{v} ms" for t, v in zip(raw_titles, values)]
         # Colour each bar by speed: green (<50ms), amber (<200ms), red (≥200ms)
         bar_colors = [
-            "#22C55E" if v < 50 else "#F59E0B" if v < 200 else "#FF2B2B"
+            "#22C55E" if v < 50 else "#F59E0B" if v < 200 else "#EF4444"
             for v in values
         ]
+        peak_ms = max(timing_ms)
+        state.dash_perf_peak_ms = round(peak_ms, 1)
         perf_fig = go.Figure(go.Bar(
-            x=labels, y=values,
-            marker=dict(color=bar_colors),
+            y=labels, x=values,
+            orientation="h",
+            marker=dict(color=bar_colors, opacity=0.88),
             text=[f"{v} ms" for v in values],
             textposition="outside",
             cliponaxis=False,
-            customdata=raw_labels,
-            hovertemplate="%{customdata}<br>%{y} ms<extra></extra>",
+            customdata=hovers,
+            hovertemplate="%{customdata}<extra></extra>",
         ))
         perf_fig.update_layout(
             **{
                 **chart_layout,
-                "margin": {"t": 28, "b": 90, "l": 50, "r": 16},
+                "margin": {"t": 28, "b": 32, "l": 10, "r": 60},
                 "xaxis": {
                     **chart_layout["xaxis"],
-                    "tickangle": -35,
-                    "tickfont": {"size": 10},
+                    "title": "milliseconds",
+                    "rangemode": "tozero",
                 },
                 "yaxis": {
                     **chart_layout["yaxis"],
-                    "title": "ms",
-                    "rangemode": "tozero",
+                    "automargin": True,
+                    "tickfont": {"size": 10},
+                    "showgrid": False,
                 },
+                "shapes": [{
+                    "type": "line",
+                    "x0": avg_ms, "x1": avg_ms,
+                    "y0": -0.5,   "y1": len(recent) - 0.5,
+                    "line": {"color": "#F59E0B", "width": 1.5, "dash": "dot"},
+                }],
+                "annotations": [{
+                    "x": avg_ms, "y": len(recent) - 0.5,
+                    "text": f"avg {avg_ms:.0f} ms",
+                    "showarrow": False,
+                    "font": {"color": "#F59E0B", "size": 9},
+                    "xanchor": "left",
+                    "yanchor": "bottom",
+                    "xshift": 4,
+                }],
                 "showlegend": False,
             }
         )
         state.dash_perf_figure = perf_fig
-        state.perf_telemetry_table = pd.DataFrame({"Session": raw_labels, "ms": values})
+        state.perf_telemetry_table = pd.DataFrame({"Session": raw_titles, "ms": values})
         state.dash_perf_visible = True
     else:
         state.dash_perf_avg_ms   = 0.0
@@ -2339,6 +2866,43 @@ def _refresh_dashboard(state):
         state.dash_perf_visible  = False
         state.dash_perf_figure   = {}
         state.perf_telemetry_table = pd.DataFrame(columns=["Session", "ms"])
+
+    # ── Alert panel (Signoz-style threshold checks) ───────────────────────────
+    total_cards = sum(st["pipeline_by_status"].values())
+    alert_lines = []
+    if state.dash_jobs_failed > 0:
+        n = state.dash_jobs_failed
+        alert_lines.append(
+            f"**{n} failed job{'s' if n != 1 else ''}** — inspect in Batch Jobs"
+        )
+    overdue = [
+        a for a in _dash_appointments
+        if a.status == "scheduled" and a.scheduled_for < _now_iso
+    ]
+    if overdue:
+        n = len(overdue)
+        alert_lines.append(
+            f"**{n} overdue review{'s' if n != 1 else ''}** — past scheduled time"
+        )
+    if state.dash_backlog_cards > 15:
+        alert_lines.append(
+            f"🟡 **High backlog** — {state.dash_backlog_cards} cards waiting to start"
+        )
+    if total_cards >= 5 and state.dash_completion_pct < 20:
+        alert_lines.append(
+            f"🟡 **Low completion** — {state.dash_completion_pct}% of pipeline cards done"
+        )
+    state.dash_alerts_visible = bool(alert_lines)
+    state.dash_alerts_md = "  \n".join(alert_lines) if alert_lines else ""
+
+    # ── Service health summary ────────────────────────────────────────────────
+    nlp_icon = "Active" if getattr(state, "spacy_ok", True) else "Issue"
+    store_icon = "Active" if getattr(state, "store_ok", True) else "Issue"
+    orch_icon = "🟡" if state.dash_jobs_failed > 0 else "🟢"
+    state.dash_svc_health_md = (
+        f"{nlp_icon} **NLP**  ·  {store_icon} **Store**  ·  {orch_icon} **Orchestrator**"
+        f"  ·  **{state.dash_jobs_running}** running  ·  **{state.dash_jobs_done}** done"
+    )
 
     state.dash_has_reviews = bool(upcoming)
     state.dash_has_any_data = (
@@ -2366,8 +2930,8 @@ def _refresh_ui_demo(state) -> None:
     state.ui_demo_top_n = top_n
     state.ui_demo_mode = mode
 
-    stats = store.stats()
-    sessions = list(store.list_sessions())
+    stats = _cached_stats()
+    sessions = _cached_sessions()
     entity_counts = dict(stats.get("entity_breakdown", {}) or {})
     sorted_entities = sorted(entity_counts.items(), key=lambda x: (-x[1], x[0]))
     total_entities = int(sum(v for _, v in sorted_entities))
@@ -2486,7 +3050,11 @@ def _refresh_ui_demo(state) -> None:
                 labels=labels,
                 parents=[""] * len(labels),
                 values=counts,
-                marker=dict(colors=counts, colorscale="Blues"),
+                marker=dict(
+                    colors=counts,
+                    colorscale=GEO_DARK_SCALE,
+                    line=dict(color="#17191D", width=1),
+                ),
                 textinfo="label+value+percent root",
             )
         )
@@ -2580,8 +3148,17 @@ def _refresh_ui_demo(state) -> None:
         )
         if not tdf.empty:
             timeline_fig = go.Figure()
-            timeline_fig.add_scatter(x=tdf["Date"], y=tdf["Sessions"], mode="lines+markers", name="Sessions")
-            timeline_fig.add_bar(x=tdf["Date"], y=tdf["Entities"], name="Entities", opacity=0.45)
+            timeline_fig.add_scatter(
+                x=tdf["Date"], y=tdf["Sessions"],
+                mode="lines+markers", name="Sessions",
+                line=dict(color=COLOR_PRIMARY, width=2),
+                marker=dict(color=COLOR_PRIMARY, size=5),
+            )
+            timeline_fig.add_bar(
+                x=tdf["Date"], y=tdf["Entities"],
+                name="Entities", opacity=0.5,
+                marker_color=COLOR_SUCCESS,
+            )
             timeline_fig.update_layout(
                 **{
                     **chart_layout,
@@ -2664,7 +3241,6 @@ def _refresh_ui_demo(state) -> None:
                         outlinecolor="#E7D4C8",
                     ),
                     opacity=0.94,
-                    line=dict(color="#FFF8F2", width=1.8),
                 ),
                 hovertemplate="%{text}<extra></extra>",
             )
@@ -3226,12 +3802,15 @@ def _set_qt_entity_state(state, entities: List[Dict[str, Any]]) -> Counter:
             "yaxis": {**chart_layout["yaxis"], "automargin": True},
             "bargap": 0.22,
         }
+        _qt_n = len(qdf)
+        _qt_b = max(0, 6 - _qt_n + 1)
+        _qt_colors = [mono_colorway[min(6, _qt_b + i)] for i in range(_qt_n)]
         fig_qt = go.Figure(
             go.Bar(
                 x=qdf["Count"],
                 y=qdf["Entity Type"],
                 orientation="h",
-                marker=dict(color=mono_colorway[0]),
+                marker=dict(color=_qt_colors),
                 text=[str(int(v)) for v in qdf["Count"]],
                 textposition="outside",
                 cliponaxis=False,
@@ -3289,7 +3868,45 @@ def _set_qt_entity_state(state, entities: List[Dict[str, Any]]) -> Counter:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def on_init(state):
+    # ── Bind authenticated identity from trusted proxy headers ───────────────
+    # on_init fires inside a Flask HTTP request context (registered as a Flask
+    # URL rule at /taipy-init). flask.request.headers is fully accessible here.
+    # Runtime-verified 2026-03-22: headers present → values read; headers
+    # absent → .get() returns ""; exception path → graceful degradation.
+    try:
+        from flask import request as _freq
+        _identity = bind_identity_from_request_headers(
+            _freq.headers,
+            getattr(_freq, "remote_addr", "") or "",
+        )
+        state.gui_user = _identity.user
+        state.gui_user_email = _identity.email
+        state.gui_user_groups = _identity.groups
+        state.gui_auth_identity = _identity.email or _identity.user
+        state.gui_auth_source = _identity.auth_source
+    except Exception as _exc:
+        _log.warning("on_init: could not read proxy identity headers: %s", _exc)
+        state.gui_user        = ""
+        state.gui_user_email  = ""
+        state.gui_user_groups = ""
+        state.gui_auth_identity = ""
+        state.gui_auth_source = "unauthenticated"
+    # ── End identity binding ─────────────────────────────────────────────────
     _register_live_state(state)
+    _clear_authenticated_user(state)
+    state.email_notifications = True
+    state.in_app_notifications = True
+    state.auth_mode = "Sign In"
+    state.auth_mode_lov = ["Sign In", "Register"]
+    state.auth_role_lov = list(VALID_ROLES)
+    state.auth_status_md = ""
+    _clear_auth_form(state)
+    # ── Demo mode: auto-login as Admin, no email/password required ───────────
+    if _DEMO_MODE:
+        state.is_demo_mode = True
+        state.demo_role = "Admin"
+        state.demo_role_lov = list(VALID_ROLES)
+        _apply_demo_role(state, "Admin")
     state.store_status = describe_store_backend()
     state.store_status_label, state.store_status_hover = _store_status_ui(state.store_status)
     state.raw_input_status_label, state.raw_input_status_hover = _raw_input_backend_ui()
@@ -3314,6 +3931,7 @@ def on_init(state):
     _refresh_job_table(state)
     _sync_active_job_progress(state, load_results_on_done=True)
     _refresh_sessions(state)
+    _refresh_telemetry(state)
     # Pre-populate PII Text page so it's immediately useful
     try:
         ents = engine.analyze(state.qt_input, state.qt_entities, state.qt_threshold)
@@ -3321,12 +3939,143 @@ def on_init(state):
         _set_qt_entity_state(state, ents)
     except Exception:
         pass
-    navigate(state, "dashboard")
+    scheduler.sync(store.list_appointments())
+    scheduler.start()
+    navigate(state, "auth")
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
+def on_auth_mode_change(state, var_name=None, value=None):
+    state.auth_mode = str(value or state.auth_mode or "Sign In")
+    state.auth_status_md = ""
+
+
+def on_auth_toggle_mode(state):
+    state.auth_mode = "Register" if state.auth_mode == "Sign In" else "Sign In"
+    state.auth_status_md = ""
+
+
+def on_auth_clear(state):
+    _clear_auth_form(state)
+    state.auth_status_md = ""
+
+
+def on_auth_register(state):
+    ok, message, user = register_user(
+        store,
+        email=state.auth_email,
+        password=state.auth_password,
+        confirm_password=state.auth_confirm_password,
+        role=state.auth_role,
+        full_name=state.auth_full_name,
+    )
+    if not ok:
+        state.auth_status_md = f"**Registration error:** {message}"
+        notify(state, "error", message)
+        return
+    store.log_user_action(user.email, "auth.register", "user", user.id, f"Registered with role {user.role}")
+    _set_authenticated_user(state, user)
+    _clear_auth_form(state)
+    state.auth_status_md = f"**Account created.** Signed in as `{user.email}`."
+    notify(state, "success", message)
+    navigate(state, "dashboard")
+
+
+def on_auth_login(state):
+    ok, message, user = authenticate_user(store, email=state.auth_email, password=state.auth_password)
+    if not ok:
+        state.auth_status_md = f"**Sign-in error:** {message}"
+        notify(state, "error", message)
+        return
+    store.log_user_action(user.email, "auth.login", "user", user.id, f"Signed in as {user.role}")
+    _set_authenticated_user(state, user)
+    _clear_auth_form(state)
+    state.auth_status_md = f"**Signed in.** Welcome back, `{user.email}`."
+    notify(state, "success", message)
+    navigate(state, "dashboard")
+
+def on_toggles_email_notifications(state, value):
+    state.email_notifications = value
+    save_notification_settings(state)
+
+def on_toggles_in_app_notifications(state, value):
+    state.in_app_notifications = value
+    save_notification_settings(state)  
+
+def save_notification_settings(state):
+    if not state.is_authenticated:
+        return
+    store.update_user_settings(
+        user_id=state.current_user_id,
+        email_notifications=state.email_notifications,
+        in_app_notifications=state.in_app_notifications,
+    )      
+
+    notify(state, "success", "Notification settings updated.")
+
+def send_user_notification(state, message, subject = "Notification"):    
+    if state.in_app_notifications:
+        notify(state, "info", message)
+
+    if state.email_notifications:
+        send_email_notification(
+            recipient = state.current_user_email,
+            subject = subject,
+            message = message
+            )    
+        
+def on_auth_logout(state):
+    actor = getattr(state, "current_user_email", "") or "anonymous"
+    user_id = getattr(state, "current_user_id", "")
+    if actor and user_id:
+        store.log_user_action(actor, "auth.logout", "user", user_id, "Signed out")
+    _clear_authenticated_user(state)
+    _clear_auth_form(state)
+    if _DEMO_MODE:
+        # In demo mode, re-login immediately with current demo_role instead of showing auth page
+        _apply_demo_role(state, getattr(state, "demo_role", "Admin"), navigate_to_dashboard=True)
+        notify(state, "info", "Role reset to demo mode.")
+        return
+    state.auth_status_md = "You have been signed out."
+    notify(state, "info", "Signed out.")
+    navigate(state, "auth")
+
+
+def on_demo_role_change(state, var, val):
+    """Switch the active role in demo mode — no re-login required."""
+    role = str(val or "Admin")
+    if role not in VALID_ROLES:
+        role = "Admin"
+    state.demo_role = role
+    _apply_demo_role(state, role, navigate_to_dashboard=True)
+    notify(state, "info", f"Now viewing as: {role}")
+
+
+def _apply_demo_role(state, role: str, navigate_to_dashboard: bool = False) -> None:
+    """Auto-login as a named demo user with the given role."""
+    from store.models import UserAccount
+    demo_user = UserAccount(
+        id=f"demo-{role.lower().replace(' ', '-')}",
+        email=f"demo-{role.lower().replace(' ', '-')}@demo.local",
+        full_name=f"Demo {role}",
+        role=role,
+    )
+    _set_authenticated_user(state, demo_user)
+    if navigate_to_dashboard and _is_authenticated(state):
+        navigate(state, "dashboard")
+
+
+def on_auth_go_dashboard(state):
+    if not _is_authenticated(state):
+        notify(state, "warning", "Please sign in first.")
+        navigate(state, "auth")
+        return
+    navigate(state, "dashboard")
+    _refresh_dashboard(state)
+
+
 def on_menu_action(state, id, payload):
-    valid_pages = {"dashboard", "analyze", "jobs", "pipeline", "schedule", "audit", "ui_demo"}
+    valid_pages = {"auth", "dashboard", "analyze", "jobs", "pipeline", "schedule", "audit", "ui_demo", "telemetry", "settings"}
 
     def _normalize_page(value: Any) -> Optional[str]:
         if not isinstance(value, str):
@@ -3360,9 +4109,14 @@ def on_menu_action(state, id, payload):
     if page is None:
         page = _normalize_page(id)
     if page is None:
-        page = "dashboard"
+        page = "auth" if not _is_authenticated(state) else "dashboard"
+    if not _can_access_page(state, page):
+        notify(state, "warning", "That page is not available for your current role.")
+        page = "auth" if not _is_authenticated(state) else "dashboard"
     navigate(state, page)
-    if page == "dashboard":
+    if page == "auth":
+        _sync_auth_ui(state)
+    elif page == "dashboard":
         _refresh_dashboard(state)
     elif page == "analyze":
         _refresh_sessions(state)
@@ -3377,6 +4131,12 @@ def on_menu_action(state, id, payload):
     elif page == "ui_demo":
         _refresh_ui_demo(state)
         _refresh_plotly_playground(state)
+    elif page == "telemetry":
+        _refresh_telemetry(state)
+    state.active_page = page
+
+    for n in scheduler.flush_notifications():
+        notify(state, n["level"], n["msg"])
 
 
 def on_taipy_event(state, event):
@@ -3391,10 +4151,38 @@ def on_taipy_event(state, event):
         op = str(getattr(event, "operation", ""))
         attr = str(getattr(event, "attribute_name", ""))
         val = str(getattr(event, "attribute_value", ""))
-        if "JOB" in ent and "UPDATE" in op and attr == "status" and "FAILED" in val.upper():
-            notify(state, "error", "A Taipy job failed. Open Errors / Audit for details.")
+        eid = str(getattr(event, "entity_id", "") or "")
+        short_id = eid[:16] if eid else "?"
+        # ── Audit trail for Taipy-native events ──────────────────────────────
+        if "SCENARIO" in ent and "CREATION" in op:
+            store.log_user_action("system", "taipy.scenario.created", "scenario", short_id,
+                                  f"Scenario created", severity="info")
+        elif "JOB" in ent and "UPDATE" in op and attr == "status":
+            val_up = val.upper()
+            if "COMPLETED" in val_up or "SKIPPED" in val_up:
+                store.log_user_action("system", "taipy.job.completed", "job", short_id,
+                                      f"Job reached status {val}", severity="info")
+            elif "FAILED" in val_up or "ABANDONED" in val_up:
+                store.log_user_action("system", "taipy.job.failed", "job", short_id,
+                                      f"Job reached status {val}", severity="warning")
+                notify(state, "error", "A Taipy job failed. Open the Errors tab for details.")
+            elif "CANCELED" in val_up:
+                store.log_user_action("system", "taipy.job.canceled", "job", short_id,
+                                      f"Job canceled", severity="info")
+            elif "RUNNING" in val_up:
+                store.log_user_action("system", "taipy.job.running", "job", short_id,
+                                      f"Job started running", severity="info")
     except Exception:
         pass
+    # Refresh the telemetry page if the user is viewing it.
+    try:
+        if getattr(state, "active_page", "") == "telemetry":
+            _refresh_telemetry(state)
+    except Exception:
+        pass
+
+    for n in scheduler.flush_notifications():
+        notify(state, n["level"], n["msg"])
 
 
 # ── Global on_change for table selection (single-click) ──────────────────────
@@ -3702,12 +4490,19 @@ def on_select_done_card(state):
 
 
 # ── Quick-text PII ────────────────────────────────────────────────────────────
+def _parse_word_lists(state) -> tuple[list, list]:
+    """Parse comma-separated allowlist and denylist text from state."""
+    allowlist = [w.strip() for w in state.qt_allowlist_text.split(",") if w.strip()]
+    denylist  = [w.strip() for w in state.qt_denylist_text.split(",") if w.strip()]
+    return allowlist, denylist
+
+
+
 def on_qt_analyze(state):
     if not state.qt_input.strip():
         notify(state, "warning", "Enter some text first.")
         return
-    allowlist = [w.strip() for w in state.qt_allowlist_text.split(",") if w.strip()]
-    denylist  = [w.strip() for w in state.qt_denylist_text.split(",") if w.strip()]
+    allowlist, denylist = _parse_word_lists(state)
     ents = engine.analyze(
         state.qt_input,
         state.qt_entities,
@@ -3755,11 +4550,14 @@ def on_qt_ner_model_change(state, var_name=None, value=None):
 
 
 def on_qt_anonymize(state):
+    if not _is_authenticated(state):
+        notify(state, "warning", "Please sign in to analyze text.")
+        navigate(state, "auth")
+        return
     if not state.qt_input.strip():
         notify(state, "warning", "Enter some text first.")
         return
-    allowlist = [w.strip() for w in state.qt_allowlist_text.split(",") if w.strip()]
-    denylist  = [w.strip() for w in state.qt_denylist_text.split(",") if w.strip()]
+    allowlist, denylist = _parse_word_lists(state)
     t0 = time.perf_counter()
     qt_operator = str(getattr(state, "qt_operator", "replace") or "replace").strip().lower()
     operator_for_engine = "replace" if qt_operator == "synthesize" else qt_operator
@@ -3910,10 +4708,10 @@ def on_store_apply(state):
     duckdb_path = (state.store_duckdb_path or "").strip()
 
     if backend == "mongo" and not uri:
-        state.store_settings_msg = "⚠ MongoDB URI is required (e.g. mongodb://localhost:27017/anon_studio)."
+        state.store_settings_msg = "MongoDB URI is required (e.g. mongodb://localhost:27017/anon_studio)."
         return
     if backend == "duckdb" and not duckdb_path:
-        state.store_settings_msg = "⚠ DuckDB path is required (e.g. /tmp/anon_studio.duckdb)."
+        state.store_settings_msg = "DuckDB path is required (e.g. /tmp/anon_studio.duckdb)."
         return
 
     os.environ["ANON_STORE_BACKEND"] = backend
@@ -3961,16 +4759,16 @@ def on_store_apply(state):
         state.store_backend_sel = get_store_backend_mode()
         if backend == "mongo":
             state.store_settings_msg = (
-                f"⚠ pymongo is not installed. Kept previous backend. "
+                f"pymongo is not installed. Kept previous backend. "
                 f"Run: pip install 'pymongo[srv]>=4.7' ({exc})"
             )
         elif backend == "duckdb":
             state.store_settings_msg = (
-                f"⚠ duckdb is not installed. Kept previous backend. "
+                f"duckdb is not installed. Kept previous backend. "
                 f"Run: pip install 'duckdb>=1.0' ({exc})"
             )
         else:
-            state.store_settings_msg = f"⚠ Backend dependency missing: {exc}"
+            state.store_settings_msg = f"Backend dependency missing: {exc}"
     except Exception as exc:
         # Connection/setup failure: keep the previous backend instead of forcing memory.
         os.environ["ANON_STORE_BACKEND"] = prev_backend
@@ -3989,7 +4787,7 @@ def on_store_apply(state):
         state.store_status = status_text
         state.store_status_label, state.store_status_hover = _store_status_ui(status_text)
         state.store_backend_sel = get_store_backend_mode()
-        state.store_settings_msg = f"⚠ Connection failed. Kept previous backend: {exc}"
+        state.store_settings_msg = f"Connection failed. Kept previous backend: {exc}"
 
 
 def on_qt_clear(state):
@@ -4042,16 +4840,23 @@ def _refresh_sessions(state):
         card_options.append((f"{c.id[:8]} | {title} | {status_label}", c.id))
     state.qt_card_opts = card_options
 
-
 def on_qt_save_session(state):
     if not state.qt_anonymized_raw:
         notify(state, "warning", "Run Anonymize first before saving.")
         return
+
     title = (state.qt_input.strip().splitlines()[0][:50] or "Untitled Session")
     counts: Dict[str, int] = {}
     for _, row in state.qt_entity_rows.iterrows():
         counts[row["Entity Type"]] = counts.get(row["Entity Type"], 0) + 1
-    card_id = str(getattr(state, "qt_card_f", "") or "").strip()
+
+    raw_card = getattr(state, "qt_card_f", "") or ""
+
+    if isinstance(raw_card, (list, tuple)) and len(raw_card) >= 2:
+        card_id = str(raw_card[1]).strip()
+    else:
+        card_id = str(raw_card).strip()
+
     session = PIISession(
         title=title,
         original_text=state.qt_input,
@@ -4063,25 +4868,72 @@ def on_qt_save_session(state):
         processing_ms=float(getattr(state, "qt_last_proc_ms", 0.0) or 0.0),
         pipeline_card_id=card_id or None,
     )
-    store.add_session(session)
-    store.log_user_action("user", "session.save", "session", session.id,
-                          f"Saved session '{title}' ({len(counts)} entity types)")
+
+    try:
+        store.add_session(session)
+    except Exception as e:
+        notify(state, "error", f"Failed to save session: {e}")
+        return
+
+    try:
+        store.log_user_action(
+            "user",
+            "session.save",
+            "session",
+            session.id,
+            f"Saved session '{title}' ({len(counts)} entity types)"
+        )
+    except Exception:
+        pass
+
     if card_id:
-        linked_card = store.get_card(card_id)
-        if linked_card:
-            store.update_card(card_id, session_id=session.id)
-            store.log_user_action(
-                "user", "session.attach", "card", card_id,
-                f"Session {session.id[:8]} attached to '{linked_card.title}'",
-                severity=_priority_to_severity(getattr(linked_card, "priority", "medium")),
+        try:
+            all_cards = store.list_cards()
+            linked_card = next(
+                (c for c in all_cards if str(getattr(c, "id", "")) == card_id),
+                None
             )
-        else:
-            notify(state, "warning", "Selected card not found — session saved without card link.")
+
+            if linked_card:
+                store.update_card(card_id, session_id=session.id)
+
+                try:
+                    store.log_user_action(
+                        "user",
+                        "session.attach",
+                        "card",
+                        card_id,
+                        f"Session {session.id[:8]} attached to '{linked_card.title}'",
+                        severity=_priority_to_severity(
+                            getattr(linked_card, "priority", "medium")
+                        ),
+                    )
+                except Exception:
+                    pass
+            else:
+                notify(state, "warning", "Selected card not found — session saved without card link.")
+
+        except Exception as e:
+            notify(state, "warning", f"Session saved, but card link failed: {e}")
+
+
     state.qt_session_saved = True
-    _refresh_sessions(state)
-    _refresh_dashboard(state)
-    notify(state, "success", f"Session saved (ID: {session.id[:8]})"
-           + (f" → card {card_id[:8]}" if card_id else ""))
+
+    try:
+        _refresh_sessions(state)
+    except Exception:
+        pass
+
+    try:
+        _refresh_dashboard(state)
+    except Exception:
+        pass
+
+    notify(
+        state,
+        "success",
+        f"Session saved (ID: {session.id[:8]})" + (f" → card {card_id[:8]}" if card_id else "")
+    )    
 
 
 def on_qt_load_session(state):
@@ -4121,6 +4973,35 @@ def on_qt_session_select(state, var_name, value):
     sid = str(row.get("full_id", "") or "")
     if sid:
         state.qt_selected_session = sid
+
+
+def on_qt_download_session(state):
+    """Download anonymized text + entity CSV for a saved session without loading it."""
+    sid = state.qt_selected_session
+    if not sid:
+        notify(state, "warning", "Select a session from the table first.")
+        return
+    session = store.get_session(sid)
+    if not session:
+        notify(state, "error", "Session not found.")
+        return
+
+    anon_text = session.anonymized_text or ""
+    entities = session.entities or []
+    label = (session.title or sid[:8]).replace(" ", "_")[:40]
+
+    # Download anonymized text
+    download(state, content=anon_text.encode("utf-8"), name=f"{label}_anonymized.txt")
+
+    # Also download entity CSV if available
+    if entities:
+        df = pd.DataFrame(entities)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        download(state, content=csv_bytes, name=f"{label}_entities.csv")
+
+    store.log_user_action("user", "session.download", "session", sid,
+                          f"Downloaded session '{session.title}'")
+    notify(state, "success", f"Session '{session.title}' downloaded.")
 
 
 def on_file_upload(state, action, payload):
@@ -4163,15 +5044,16 @@ def on_file_upload(state, action, payload):
         state.job_file_hash = file_hash
         state.job_file_art  = _drunken_bishop(file_hash, name)
         notify(state, "success", f"{name} ready.")
-    except Exception as e:
-        (_log.exception("upload_error"), notify(state, "error", "File upload failed. Check the file and try again."))[1]
+    except Exception:
+        _log.exception("upload_error")
+        notify(state, "error", "File upload failed. Check the file and try again.")
+
 
 
 def _bg_submit_job(raw_df, config):
     """
-    Runs in a background thread (via invoke_long_callback).
     Creates the Scenario, writes DataNodes, submits to Orchestrator.
-    Returns (taipy_scenario_id, job_id, submission_id) so _bg_job_done can update the card.
+    Returns (taipy_scenario_id, job_id, submission_id) for UI/state updates.
     """
     # Apply runtime MongoDB write batch size override before DataNode write.
     batch = config.get("mongo_write_batch")
@@ -4183,6 +5065,22 @@ def _bg_submit_job(raw_df, config):
     if sub_id:
         _SUBMISSION_IDS[config["job_id"]] = sub_id
     return sc.id, config["job_id"], sub_id
+
+
+def _apply_submission_result(state, result) -> None:
+    """Update UI/runtime registries after a Taipy submission succeeds."""
+    if result and isinstance(result, tuple) and len(result) >= 2:
+        taipy_sc_id, job_id = result[0], result[1]
+        sub_id = str(result[2]) if len(result) > 2 and result[2] else ""
+        if sub_id:
+            _SUBMISSION_IDS[job_id] = sub_id
+        if state.active_job_id == job_id:
+            state.job_active_submission_id = sub_id
+            state.job_submission_status = "Submitted"
+        for c in store.list_cards():
+            if getattr(c, "job_id", None) == job_id:
+                store.update_card(c.id, scenario_id=taipy_sc_id)
+    _sync_active_job_progress(state, load_results_on_done=True)
 
 
 def _sync_active_job_progress(state, load_results_on_done: bool = True) -> bool:
@@ -4294,18 +5192,7 @@ def _bg_job_done(state, status, result):
         notify(state, "error", "Job submission failed in background task.")
         return
 
-    if result and isinstance(result, tuple) and len(result) >= 2:
-        taipy_sc_id, job_id = result[0], result[1]
-        sub_id = str(result[2]) if len(result) > 2 and result[2] else ""
-        if sub_id:
-            _SUBMISSION_IDS[job_id] = sub_id
-            if state.active_job_id == job_id:
-                state.job_active_submission_id = sub_id
-                state.job_submission_status = "Submitted"
-        for c in store.list_cards():
-            if getattr(c, "job_id", None) == job_id:
-                store.update_card(c.id, scenario_id=taipy_sc_id)
-    _sync_active_job_progress(state, load_results_on_done=True)
+    _apply_submission_result(state, result)
     notify(state, "success", "Job submitted to Orchestrator.")
 
 
@@ -4333,11 +5220,17 @@ def on_submission_status_change(state, submittable, details):
 
 def on_submit_job(state):
     """Validate inputs, parse the file, then fire invoke_long_callback."""
+    if not _require_action_role(state, "job_submit", "Batch job submission"):
+        return
     # Resolve bytes from per-session cache (preferred) or Taipy's bound variable (fallback)
     sid = get_state_id(state)
     raw_bytes, _slot = resolve_upload_bytes(state, _FILE_CACHE, sid)
     if not raw_bytes:
         notify(state, "warning", "Upload a CSV or Excel file first.")
+        return
+
+    if not state.job_entities:
+        notify(state, "warning", "Select at least one entity type before running a job.")
         return
 
     fname = (_slot.get("name") or state.job_file_name or "")
@@ -4440,19 +5333,45 @@ def on_submit_job(state):
               f"{row_count:,} rows · {state.job_operator} · "
               f"{len(state.job_entities)} entity types")
 
-    invoke_long_callback(
-        state,
-        user_function=_bg_submit_job,
-        user_function_args=[raw_input_payload, config],
-        user_status_function=_bg_job_done,
-        period=_JOB_UI_POLL_MS,
-    )
+    try:
+        if not tp.is_orchestrator_running():
+            notify(state, "warning", "Taipy Orchestrator is not running — job will queue but not execute until it starts.")
+    except Exception:
+        _log.exception("Failed to check Taipy Orchestrator status")
+
+    try:
+        result = _bg_submit_job(raw_input_payload, config)
+    except Exception as exc:
+        _log.exception("job_submit_error")
+        state.job_is_running = False
+        state.job_progress_status = "error"
+        state.job_submission_status = "Failed"
+        state.job_progress_msg = f"Job submission failed: {exc}"
+        _persist_progress(
+            job_id,
+            {
+                "pct": 0.0,
+                "processed": 0,
+                "total": row_count,
+                "message": state.job_progress_msg,
+                "status": "error",
+                "updated_at": time.time(),
+            },
+        )
+        _FILE_CACHE.pop(sid, None)
+        _refresh_job_health(state)
+        _refresh_job_table(state)
+        _refresh_dashboard(state)
+        notify(state, "error", "Job submission failed.")
+        return
+
+    _apply_submission_result(state, result)
 
     # Release the upload slot — file bytes no longer needed in memory
     _FILE_CACHE.pop(sid, None)
 
     _refresh_job_table(state)
-    notify(state, "info", f"Job {job_id[:8]} submitted — "
+    notify(state, "success", f"Job {job_id[:8]} submitted — "
            f"{row_count:,} rows queued.")
 
 
@@ -4484,15 +5403,23 @@ def _load_job_results(state, jid: str):
             pass
         stats_data = sc.job_stats.read()
         anon_df    = sc.anon_output.read()
+        # Record completion telemetry
+        try:
+            record_job_completion(jid, stats_data or {})
+        except Exception:
+            pass
         state.stats_entity_rows = build_entity_stats_df(stats_data)
         if not state.stats_entity_rows.empty and go is not None:
             sdf = state.stats_entity_rows.sort_values("Count", ascending=True)
+            _st_n = len(sdf)
+            _st_b = max(0, 6 - _st_n + 1)
+            _st_colors = [mono_colorway[min(6, _st_b + i)] for i in range(_st_n)]
             fig_stats = go.Figure(
                 go.Bar(
                     x=sdf["Count"],
                     y=sdf["Entity Type"],
                     orientation="h",
-                    marker=dict(color=mono_colorway[0]),
+                    marker=dict(color=_st_colors),
                     text=[str(int(v)) for v in sdf["Count"]],
                     textposition="outside",
                     cliponaxis=False,
@@ -4517,6 +5444,11 @@ def _load_job_results(state, jid: str):
             state.download_scenario_id = jid
             state.download_rows        = len(anon_df)
             state.download_cols        = len(anon_df.columns)
+            try:
+                state.persp_html  = _build_perspective_html(anon_df)
+                state.persp_ready = True
+            except Exception:
+                state.persp_ready = False
         # Move linked card to review and create a PIISession for traceability
         for c in store.list_cards():
             if getattr(c, 'job_id', None) == jid and c.status == "in_progress":
@@ -4706,6 +5638,8 @@ def on_job_remove(state):
         state.preview_data = pd.DataFrame()
         state.stats_entity_rows = pd.DataFrame(columns=["Entity Type", "Count"])
         state.stats_entity_chart_figure = {}
+        state.persp_html  = ""
+        state.persp_ready = False
         store.log_user_action("user", "job.remove", "job", jid, "Removed completed job entities")
         _refresh_job_table(state)
         _refresh_dashboard(state)
@@ -4781,7 +5715,7 @@ def on_whatif_compare(state):
                 go.Bar(
                     x=chart_df["Scenario"],
                     y=chart_df["Entities"],
-                    marker=dict(color=mono_colorway[0]),
+                    marker=dict(color=COLOR_PRIMARY),
                     text=[str(int(v)) for v in chart_df["Entities"]],
                     textposition="outside",
                     cliponaxis=False,
@@ -4840,6 +5774,10 @@ def on_promote_primary(state):
 
 # ── Pipeline / Kanban ─────────────────────────────────────────────────────────
 def on_card_new(state):
+    
+    state.card_attest_f = ""
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     state.card_id_edit = ""; state.card_title_f   = ""
     state.card_desc_f  = ""; state.card_status_f  = "backlog"
     state.card_type_f  = "file"; state.card_source_f = ""
@@ -4847,33 +5785,71 @@ def on_card_new(state):
     state.card_labels_f = ""; state.card_attest_f   = ""
     state.card_session_f = "(none)"
     state.card_session_opts = ["(none)"] + [
+        
+    ]
+    state.card_form_open = True
+def on_card_new(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
+
+    state.card_id_edit = ""
+    state.card_title_f = ""
+    state.card_desc_f = ""
+    state.card_status_f = "backlog"
+    state.card_type_f = "file"
+    state.card_source_f = ""
+    state.card_assign_f = ""
+    state.card_priority_f = "medium"
+    state.card_labels_f = ""
+    state.card_attest_f = ""
+    state.card_session_f = "(none)"
+    state.card_session_opts = ["(none)"] + [
         f"{s.id[:8]} — {s.title[:35]}" for s in store.list_sessions()
     ]
     state.card_form_open = True
 
-
 def on_card_save(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     if not state.card_title_f.strip():
-        notify(state, "error", "Title is required."); return
+        notify(state, "error", "Title is required.")
+        return
+
     labels = [l.strip() for l in state.card_labels_f.split(",") if l.strip()]
+
     # Resolve selected session: "(none)" or "abc12345 — title"
     sel = state.card_session_f or "(none)"
     new_session_id = None if sel == "(none)" else sel.split(" — ")[0].strip()
+
     if state.card_id_edit:
         existing = store.get_card(state.card_id_edit)
         old_session_id = existing.session_id if existing else None
-        store.update_card(state.card_id_edit,
-                          title=state.card_title_f, description=state.card_desc_f,
-                          status=state.card_status_f, assignee=state.card_assign_f,
-                          priority=state.card_priority_f, labels=labels,
-                          attestation=state.card_attest_f,
-                          card_type=state.card_type_f, data_source=state.card_source_f,
-                          session_id=new_session_id)
-        store.log_user_action("user", "pipeline.update", "card", state.card_id_edit,
-                  f"Updated '{state.card_title_f}'",
-                  severity=_priority_to_severity(state.card_priority_f))        # Write SESSION_ATTACHED only when session actually changed
+
+        store.update_card(
+            state.card_id_edit,
+            title=state.card_title_f,
+            description=state.card_desc_f,
+            status=state.card_status_f,
+            assignee=state.card_assign_f,
+            priority=state.card_priority_f,
+            labels=labels,
+            attestation=state.card_attest_f,
+            card_type=getattr(state, "card_type_f", "file"),
+            data_source=getattr(state, "card_source_f", ""),
+            session_id=new_session_id,
+        )
+
+        store.log_user_action(
+            "user",
+            "pipeline.update",
+            "card",
+            state.card_id_edit,
+            f"Updated '{state.card_title_f}'",
+            severity=_priority_to_severity(state.card_priority_f),
+        )
+
+        # Write session.attach only when session actually changed
         if new_session_id and old_session_id != new_session_id:
-            # Prevent duplicate: check no other card already holds this session
             all_cards = store.list_cards()
             already = any(
                 c.id != state.card_id_edit and c.session_id == new_session_id
@@ -4882,25 +5858,57 @@ def on_card_save(state):
             if already:
                 notify(state, "warning", "That session is already attached to another card.")
                 return
-            store.log_user_action("user", "session.attach", "card", state.card_id_edit,
-                      f"Session {new_session_id} attached to '{state.card_title_f}'",
-                      severity=_priority_to_severity(state.card_priority_f))
+
+            store.log_user_action(
+                "user",
+                "session.attach",
+                "card",
+                state.card_id_edit,
+                f"Session {new_session_id} attached to '{state.card_title_f}'",
+                severity=_priority_to_severity(state.card_priority_f),
+            )
             store.update_session(new_session_id, pipeline_card_id=state.card_id_edit)
+
         notify(state, "success", "Card updated.")
+
     else:
-        c = PipelineCard(title=state.card_title_f, description=state.card_desc_f,
-                         status=state.card_status_f, assignee=state.card_assign_f,
-                         priority=state.card_priority_f, labels=labels,
-                         attestation=state.card_attest_f,
-                         card_type=state.card_type_f, data_source=state.card_source_f,
-                         session_id=new_session_id)
+        c = PipelineCard(
+            title=state.card_title_f,
+            description=state.card_desc_f,
+            status=state.card_status_f,
+            assignee=state.card_assign_f,
+            priority=state.card_priority_f,
+            labels=labels,
+            attestation=state.card_attest_f,
+            card_type=getattr(state, "card_type_f", "file"),
+            data_source=getattr(state, "card_source_f", ""),
+            session_id=new_session_id,
+        )
+
         store.add_card(c)
+
+        store.log_user_action(
+            "user",
+            "CARD_CREATED",
+            "card",
+            c.id,
+            f"Created '{state.card_title_f}' in Intake",
+            severity=_priority_to_severity(state.card_priority_f),
+        )
+
         if new_session_id:
-            store.log_user_action("user", "session.attach", "card", c.id,
-                      f"Session {new_session_id} attached to '{state.card_title_f}'",
-                      severity=_priority_to_severity(state.card_priority_f))
+            store.log_user_action(
+                "user",
+                "session.attach",
+                "card",
+                c.id,
+                f"Session {new_session_id} attached to '{state.card_title_f}'",
+                severity=_priority_to_severity(state.card_priority_f),
+            )
             store.update_session(new_session_id, pipeline_card_id=c.id)
+
         notify(state, "success", f"Card '{state.card_title_f}' created.")
+
     state.card_form_open = False
     _refresh_pipeline(state)
     _refresh_audit(state)
@@ -4912,6 +5920,8 @@ def on_card_cancel(state):
 
 
 def on_card_edit(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     cid = _get_selected_card_id(state)
     if not cid:
         notify(state, "warning", "Select a card first."); return
@@ -4939,6 +5949,8 @@ def on_card_edit(state):
 
 
 def on_card_forward(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     cid = _get_selected_card_id(state)
     if not cid:
         notify(state, "warning", "Select a card."); return
@@ -4959,6 +5971,8 @@ def on_card_forward(state):
 
 
 def on_card_back(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     cid = _get_selected_card_id(state)
     if not cid:
         notify(state, "warning", "Select a card."); return
@@ -4979,6 +5993,8 @@ def on_card_back(state):
 
 
 def on_card_delete(state):
+    if not _require_action_role(state, "card_manage", "Pipeline editing"):
+        return
     cid = _get_selected_card_id(state)
     if not cid:
         notify(state, "warning", "Select a card."); return
@@ -4986,32 +6002,49 @@ def on_card_delete(state):
     _clear_selected_card(state, clear_selection_vars=True)
     notify(state, "success", "Card deleted.")
     _refresh_pipeline(state); _refresh_audit(state); _refresh_dashboard(state)
-
-
 def on_attest_open(state):
+    if not _require_action_role(state, "card_attest", "Compliance attestation"):
+        return
+
     cid = _get_selected_card_id(state)
     if not cid:
-        notify(state, "warning", "Select a card."); return
+        notify(state, "warning", "Select a card.")
+        return
+
     state.attest_cid = cid
-    state.attest_note = ""; state.attest_by = ""
+    state.attest_note = ""
+    state.attest_by = ""
     state.attest_open = True
 
-
 def on_attest_confirm(state):
+    if getattr(state, "gui_auth_source", "unauthenticated") not in {"proxy", "break_glass"} or not getattr(state, "gui_user", ""):
+        notify(state, "error",
+               "Attestation requires an authenticated session. "
+               "Sign in via the auth proxy or enable local break-glass access before attesting."); return
+
+    _principal = principal_for(state)
+    if not authz_check(_principal, "can_attest", "card", state.attest_cid):
+        notify(state, "error",
+               "Authorization denied: you do not have the 'reviewer' or "
+               "'compliance_officer' role on this card."); return
+
     if not state.attest_by.strip():
         notify(state, "error", "Name required."); return
     card = store.get_card(state.attest_cid)
     if not card:
         notify(state, "error", "Card not found."); return
 
-    attested_by = state.attest_by.strip()
-    attested_at = _now()
+    attested_by      = state.gui_user_email or state.gui_user
+    attested_at      = _now()
     attestation_note = (state.attest_note or "").strip()
     payload = build_attestation_payload(
         card=card,
         attested_by=attested_by,
         attested_at=attested_at,
         attestation_note=attestation_note,
+        actor_sub=state.gui_user,
+        actor_name=state.gui_user,
+        actor_email=state.gui_user_email,
     )
     sig = sign_attestation_payload(payload)
     if signature_required() and not sig.signed:
@@ -5093,6 +6126,8 @@ def on_card_history_close(state):
 
 # ── Schedule ──────────────────────────────────────────────────────────────────
 def on_appt_new(state):
+    if not _require_action_role(state, "appointment_manage", "Review scheduling"):
+        return
     state.appt_id_edit = ""; state.appt_title_f = "PII Review"
     state.appt_desc_f  = ""; state.appt_date_f  = None
     state.appt_time_f  = "10:00"; state.appt_dur_f = 30
@@ -5102,6 +6137,8 @@ def on_appt_new(state):
 
 
 def on_appt_save(state):
+    if not _require_action_role(state, "appointment_manage", "Review scheduling"):
+        return
     if not state.appt_title_f.strip():
         notify(state, "error", "Title required."); return
     if not state.appt_date_f:
@@ -5118,6 +6155,9 @@ def on_appt_save(state):
                           attendees=atts,
                           pipeline_card_id=state.appt_card_f or None,
                           status=state.appt_status_f)
+        scheduler.cancel(state.appt_id_edit)
+        appt = store.get_appointment(state.appt_id_edit)
+        scheduler.register(appt)
         notify(state, "success", "Appointment updated.")
     else:
         a = Appointment(title=state.appt_title_f, description=state.appt_desc_f,
@@ -5125,6 +6165,7 @@ def on_appt_save(state):
                         attendees=atts,
                         pipeline_card_id=state.appt_card_f or None)
         store.add_appointment(a)
+        scheduler.register(a)
         notify(state, "success", f"'{a.title}' scheduled.")
     state.appt_form_open = False
     _refresh_appts(state); _refresh_audit(state); _refresh_dashboard(state)
@@ -5142,6 +6183,8 @@ def on_appt_select(state, var_name, value):
 
 
 def on_appt_edit(state):
+    if not _require_action_role(state, "appointment_manage", "Review scheduling"):
+        return
     aid = state.sel_appt_id
     if not aid:
         notify(state, "warning", "Select an appointment."); return
@@ -5164,6 +6207,8 @@ def on_appt_edit(state):
 
 
 def on_appt_delete(state):
+    if not _require_action_role(state, "appointment_manage", "Review scheduling"):
+        return
     aid = state.sel_appt_id
     if not aid:
         notify(state, "warning", "Select an appointment."); return
@@ -5182,8 +6227,29 @@ def on_audit_clear(state):
     _refresh_audit(state)
 
 
+def on_export_audit_csv(state):
+    """Download the current audit log as a CSV file."""
+    if getattr(state, "gui_auth_source", "unauthenticated") not in {"proxy", "break_glass"} or not getattr(state, "gui_user", ""):
+        notify(state, "error",
+               "Audit export requires an authenticated session. "
+               "Sign in via the auth proxy or enable local break-glass access first."); return
+    _principal = principal_for(state)
+    if not authz_check(_principal, "can_export", "audit_log", "global"):
+        notify(state, "error",
+               "Authorization denied: 'compliance_officer' or 'admin' role required "
+               "to export the audit log."); return
+
+    df = state.audit_table
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        csv_bytes = df.to_csv(index=False).encode()
+        download(state, content=csv_bytes, name="audit_log.csv")
+        notify(state, "success", f"Exported {len(df)} audit entries as CSV.")
+
+
 def on_audit_export_csv(state):
     """Export the full audit log as a CSV download."""
+    if not _require_action_role(state, "audit_export", "Audit export"):
+        return
     try:
         entries = store.list_audit()
         if not entries:
@@ -5202,8 +6268,31 @@ def on_audit_export_csv(state):
         notify(state, "error", "Failed to export audit log.")
 
 
+def on_export_audit_json(state):
+    """Download the current audit log as a JSON file."""
+    if getattr(state, "gui_auth_source", "unauthenticated") not in {"proxy", "break_glass"} or not getattr(state, "gui_user", ""):
+        notify(state, "error",
+               "Audit export requires an authenticated session. "
+               "Sign in via the auth proxy or enable local break-glass access first."); return
+    _principal = principal_for(state)
+    if not authz_check(_principal, "can_export", "audit_log", "global"):
+        notify(state, "error",
+               "Authorization denied: 'compliance_officer' or 'admin' role required "
+               "to export the audit log."); return
+
+    df = state.audit_table
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        import json
+        records = df.to_dict(orient="records")
+        json_bytes = json.dumps(records, indent=2, default=str).encode()
+        download(state, content=json_bytes, name="audit_log.json")
+        notify(state, "success", f"Exported {len(df)} audit entries as JSON.")
+
+
 def on_audit_export_json(state):
     """Export the full audit log as a JSON download."""
+    if not _require_action_role(state, "audit_export", "Audit export"):
+        return
     try:
         entries = store.list_audit()
         if not entries:
@@ -5222,42 +6311,61 @@ def on_audit_export_json(state):
 
 
 def on_pipeline_export_csv(state):
-    """Export all pipeline cards as a CSV download."""
+    """Export pipeline cards as a CSV download, optionally filtered by status."""
+    if not _require_action_role(state, "pipeline_export", "Pipeline export"):
+        return
     try:
-        cards = store.list_cards()
+        status_filter = str(getattr(state, "pipeline_export_status_filter", "All") or "All")
+        if status_filter and status_filter != "All":
+            cards = store.list_cards(status=status_filter)
+            label = f"{status_filter} "
+        else:
+            cards = store.list_cards()
+            label = ""
         if not cards:
-            notify(state, "warning", "No pipeline cards to export.")
+            notify(state, "warning", f"No {label}pipeline cards to export.")
             return
         rows = [dataclasses.asdict(c) for c in cards]
         df = pd.DataFrame(rows)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-        download(state, content=csv_bytes, name="pipeline_cards.csv")
+        filename = f"pipeline_{status_filter.lower()}.csv" if status_filter != "All" else "pipeline_cards.csv"
+        download(state, content=csv_bytes, name=filename)
         store.log_user_action("user", "pipeline.export", "pipeline", "",
-                              f"Exported {len(cards)} pipeline cards as CSV")
+                              f"Exported {len(cards)} {label}pipeline cards as CSV")
         _refresh_audit(state)
-        notify(state, "success", f"Exported {len(cards)} pipeline cards as CSV.")
+        notify(state, "success", f"Exported {len(cards)} {label}pipeline cards as CSV.")
     except Exception as e:
         _log.exception("pipeline_export_csv_error")
         notify(state, "error", "Failed to export pipeline cards.")
 
 
 def on_pipeline_export_json(state):
-    """Export all pipeline cards as a JSON download."""
+    """Export pipeline cards as a JSON download, optionally filtered by status."""
+    if not _require_action_role(state, "pipeline_export", "Pipeline export"):
+        return
     try:
-        cards = store.list_cards()
+        status_filter = str(getattr(state, "pipeline_export_status_filter", "All") or "All")
+        if status_filter and status_filter != "All":
+            cards = store.list_cards(status=status_filter)
+            label = f"{status_filter} "
+        else:
+            cards = store.list_cards()
+            label = ""
         if not cards:
-            notify(state, "warning", "No pipeline cards to export.")
+            notify(state, "warning", f"No {label}pipeline cards to export.")
             return
         rows = [dataclasses.asdict(c) for c in cards]
         json_bytes = json.dumps(rows, indent=2, default=str).encode("utf-8")
-        download(state, content=json_bytes, name="pipeline_cards.json")
+        filename = f"pipeline_{status_filter.lower()}.json" if status_filter != "All" else "pipeline_cards.json"
+        download(state, content=json_bytes, name=filename)
         store.log_user_action("user", "pipeline.export", "pipeline", "",
-                              f"Exported {len(cards)} pipeline cards as JSON")
+                              f"Exported {len(cards)} {label}pipeline cards as JSON")
         _refresh_audit(state)
-        notify(state, "success", f"Exported {len(cards)} pipeline cards as JSON.")
+        notify(state, "success", f"Exported {len(cards)} {label}pipeline cards as JSON.")
     except Exception as e:
         _log.exception("pipeline_export_json_error")
         notify(state, "error", "Failed to export pipeline cards.")
+
 
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
@@ -5290,6 +6398,13 @@ def on_ui_demo_refresh(state):
 def on_dash_go_analyze(state):
     navigate(state, "analyze")
     _refresh_sessions(state)
+
+
+def on_logout(state, id=None, payload=None):
+    logout_url = (os.environ.get("ANON_LOGOUT_URL", "") or "").strip()
+    if not logout_url:
+        logout_url = "http://localhost:8088/oauth2/sign_out"
+    navigate(state, logout_url, tab="_self")
 
 
 def _demo_seed_fallback_entities(text: str) -> List[Dict[str, Any]]:
@@ -5468,6 +6583,8 @@ def _seed_demo_texts():
 
 def on_dash_seed_demo(state):
     """Seed one deterministic session so empty dashboard charts populate instantly."""
+    if not _require_action_role(state, "demo_seed", "Demo data generation"):
+        return
     state.qt_input = (
         "Patient: Jane Doe, DOB: 03/15/1982\n"
         "SSN: 987-65-4321 | Email: jane.doe@hospital.org\n"
@@ -5516,6 +6633,7 @@ def on_dash_seed_demo(state):
     )
     try:
         store.add_session(session)
+        _invalidate_store_caches()
         store.log_user_action(
             "user",
             "session.save",
@@ -5583,6 +6701,7 @@ def run_app():
 
     use_reloader = _env_flag("ANON_GUI_USE_RELOADER", "TAIPY_USE_RELOADER", default=False)
     debug_mode = _env_flag("ANON_GUI_DEBUG", "TAIPY_DEBUG", default=False)
+    allow_unsafe_werkzeug = _env_flag("ANON_GUI_ALLOW_UNSAFE_WERKZEUG", default=True)
     _start_live_dashboard_thread(gui)
     try:
         APP_CTX.event_processor = EventProcessor(gui)
@@ -5613,7 +6732,25 @@ def run_app():
             data_url_max_size=50 * 1024 * 1024,
             use_reloader=use_reloader,
             debug=debug_mode,
+            allow_unsafe_werkzeug=allow_unsafe_werkzeug,
+            # Increase the max_decode_packets to handle large state with many dataframes
+            async_mode="threading",
+            engineio_logger=False,
+            flask_cors=True,
         )
+        
+        # Patch engineio to increase packet limit before starting server
+        try:
+            import engineio
+            # Monkey-patch the Server class to use higher limit
+            _original_init = engineio.Server.__init__
+            def _patched_init(self, *args, **kwargs):
+                kwargs.setdefault('max_decode_packets', 100)
+                return _original_init(self, *args, **kwargs)
+            engineio.Server.__init__ = _patched_init
+        except Exception as e:
+            _log.warning("Could not patch engineio packet limit: %s", e)
+        
         if taipy_host:
             run_kwargs["host"] = taipy_host
         if taipy_port:
@@ -5650,6 +6787,22 @@ def run_app():
                 pass
         _stop_live_dashboard_thread()
 
+def demo_authz(user, action):
+    if user == "admin":
+        return "ALLOW"
+    elif user == "guest" and action == "read":
+        return "ALLOW"
+    else:
+        return "DENY"
 
-if __name__ == "__main__":
-    run_app()
+
+print("Admin trying delete:", demo_authz("admin", "delete"))
+print("Guest trying read:", demo_authz("guest", "read"))
+print("Guest trying delete:", demo_authz("guest", "delete"))
+
+authz_results = [
+    "Admin trying delete: " + demo_authz("admin", "delete"),
+    "Guest trying read: " + demo_authz("guest", "read"),
+    "Guest trying delete: " + demo_authz("guest", "delete"),
+]
+

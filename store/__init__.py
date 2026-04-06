@@ -37,7 +37,7 @@ from typing import Optional
 from store.base import StoreBase
 from store.models import (
     _now, _uid,
-    PIISession, PipelineCard, Appointment, AuditEntry,
+    PIISession, PipelineCard, Appointment, AuditEntry, UserAccount,
 )
 # Import utilities for re-export
 from store.utils import (
@@ -71,6 +71,7 @@ __all__ = [
     "StoreBase",
     # Models
     "PIISession", "PipelineCard", "Appointment", "AuditEntry",
+    "UserAccount",
     # Helpers (imported by app.py)
     "_now", "_uid",
     # Data access utilities (imported from store.utils)
@@ -120,13 +121,13 @@ def describe_store_backend() -> str:
         )
     )
     if backend == "duckdb":
-        return f"✓ DuckDB: {duckdb_path}"
+        return f"DuckDB: {duckdb_path}"
     if backend == "mongo" and mongo_uri:
-        return f"✓ MongoDB: {_mongo_host_label(mongo_uri)}"
+        return f"MongoDB: {_mongo_host_label(mongo_uri)}"
     if backend == "auto" and mongo_uri:
-        return f"✓ MongoDB (auto): {_mongo_host_label(mongo_uri)}"
+        return f"MongoDB (auto): {_mongo_host_label(mongo_uri)}"
     if backend == "mongo" and not mongo_uri:
-        return "⚠ Mongo selected but MONGODB_URI is empty. Falling back to in-memory."
+        return "Mongo selected but MONGODB_URI is empty. Falling back to in-memory."
     return "▲ In-memory store (data resets on restart)"
 
 
